@@ -1,0 +1,271 @@
+#!/bin/bash
+#SBATCH --job-name=amd-hacc-io-cmp
+#SBATCH --partition=mi2104x
+#SBATCH --nodes=4
+#SBATCH --ntasks=4
+#SBATCH --ntasks-per-node=1
+#SBATCH --time=00:45:00
+#SBATCH --output=%x-%j.out
+
+# AMD HACC-IO backend compare — same lane layout as the sorgan wrapper
+# (run_sorgan_hacc_io_compare.sbatch): posix/mpiio SPMD baselines vs the
+# split-role OMPFILE variant in write-through (wt) and write-back+close (wb)
+# postures. Launch mechanics follow the OOC AMD lane: ranks run inside the
+# container via a role script, srun --mpi=pmix, host spack MPICH override
+# (container MPICH's PMIx client silently singletons on this cluster —
+# jobs 350109-350170), and PMIx server tmpdir bind.
+
+set -euo pipefail
+
+module purge 2>/dev/null || true
+module load hpcfund 2>/dev/null || true
+
+PROJECT_NAME="${PROJECT_NAME:-io-playground}"
+if [[ -z "${PROJECT_ROOT:-}" ]]; then
+  if [[ -z "${WORK:-}" ]]; then
+    echo "Error: set PROJECT_ROOT or ensure WORK is exported by the cluster environment." >&2
+    exit 1
+  fi
+  PROJECT_ROOT="${WORK}/projects/${PROJECT_NAME}"
+fi
+REPO_ROOT="${REPO_ROOT:-${PROJECT_ROOT}/src}"
+HACC_DIR="${HACC_DIR:-${REPO_ROOT}/application/hacc-io-fork}"
+LLVM_ROOT_REMOTE="${LLVM_ROOT_REMOTE:-${PROJECT_ROOT}/llvm-infra/llvm-builds/apptainer-Debug}"
+BUILD_ROOT_REMOTE="${BUILD_ROOT_REMOTE:-${PROJECT_ROOT}/builds/latest/gfx90a}"
+CONTAINER_IMAGE="${CONTAINER_IMAGE:-${REPO_ROOT}/sifs/ompc-base_latest.sif}"
+if [[ ! -e "${CONTAINER_IMAGE}" ]]; then
+  CONTAINER_IMAGE="${REPO_ROOT}/ompc-base_latest.sif"
+fi
+PROXY_BIN="${PROXY_BIN:-}"
+if [[ -z "${PROXY_BIN}" ]]; then
+  if [[ -x "${BUILD_ROOT_REMOTE}/bin/llvm-offload-mpi-proxy-device" ]]; then
+    PROXY_BIN="${BUILD_ROOT_REMOTE}/bin/llvm-offload-mpi-proxy-device"
+  else
+    PROXY_BIN="${LLVM_ROOT_REMOTE}/bin/llvm-offload-mpi-proxy-device"
+  fi
+fi
+
+COMPARE_MODES_RAW="${HACC_COMPARE_MODES:-posix,mpiio,ompfile-wt,ompfile-wb}"
+COMPARE_PARTICLES="${HACC_COMPARE_PARTICLES:-2000000}"
+COMPARE_TASKS="${HACC_COMPARE_TASKS:-${SLURM_NTASKS}}"
+COMPARE_OUTDIR="${HACC_COMPARE_OUTDIR:-${HACC_DIR}/tmp/backend-compare-amd-${SLURM_JOB_ID}}"
+COMPARE_CLEAN_DATA="${HACC_COMPARE_CLEAN_DATA:-1}"
+BUILD_HACC="${HACC_BUILD:-1}"
+OMPFILE_SCHEDULER="${HACC_OMPFILE_SCHEDULER:-${LIBOMPFILE_SCHEDULER:-HEADNODE}}"
+RUN_MPI_TYPE="${RUN_MPI_TYPE:-pmix}"
+
+if [[ ! "${COMPARE_PARTICLES}" =~ ^[0-9]+$ ]] || (( COMPARE_PARTICLES < 1 )); then
+  echo "Error: HACC_COMPARE_PARTICLES must be a positive integer, got '${COMPARE_PARTICLES}'." >&2
+  exit 1
+fi
+if (( COMPARE_TASKS < 2 )); then
+  echo "Error: HACC compare requires at least 2 tasks." >&2
+  exit 1
+fi
+if [[ ! -e "${CONTAINER_IMAGE}" ]]; then
+  echo "Error: Apptainer image not found under ${REPO_ROOT}" >&2
+  exit 1
+fi
+if [[ ! -x "${PROXY_BIN}" ]]; then
+  echo "Error: proxy binary not found: ${PROXY_BIN}" >&2
+  exit 1
+fi
+
+# Host spack MPICH (pmi=pmix, cluster-matched) — required for every rank so
+# the PMIx client inside the container can bootstrap (see OOC lane notes).
+SPACK_ROOT="${SPACK_ROOT:-${HOME}/spack}"
+MPICH_ROOT=""
+if [[ -f "${SPACK_ROOT}/share/spack/setup-env.sh" ]]; then
+  # shellcheck disable=SC1091
+  . "${SPACK_ROOT}/share/spack/setup-env.sh" 2>/dev/null || true
+  MPICH_ROOT="$(spack location -i mpich@4.2.3 2>/dev/null || true)"
+fi
+if [[ ! -d "${MPICH_ROOT}" ]]; then
+  echo "Error: spack mpich@4.2.3 not found; host-MPI override unavailable." >&2
+  exit 1
+fi
+MPI_LIB_OVERRIDE="${MPICH_ROOT}/lib"
+
+mkdir -p "${COMPARE_OUTDIR}"
+SUMMARY_CSV="${COMPARE_OUTDIR}/hacc-io-summary.csv"
+echo "mode,interface,logical_ranks,particles_per_rank,bytes,write_s,write_mib_s,read_s,read_mib_s,verified" > "${SUMMARY_CSV}"
+
+echo "[amd-hacc-io-cmp] allocated nodes: ${SLURM_JOB_NODELIST}"
+echo "[amd-hacc-io-cmp] particles/rank=${COMPARE_PARTICLES} tasks=${COMPARE_TASKS} modes=${COMPARE_MODES_RAW}"
+
+in_container_build() {
+  local binds="${PROJECT_ROOT},${REPO_ROOT},${HOME}"
+  [[ -d /work1 ]] && binds="${binds},/work1"
+  APPTAINER_DISABLE_CACHE=1 apptainer exec --userns --no-privs --bind "${binds}" "${CONTAINER_IMAGE}" \
+    /bin/bash -lc "source '${REPO_ROOT}/sh-scripts/set_env.sh' '${LLVM_ROOT_REMOTE}' >/dev/null; export LLVM_BUILD_DIR='${LLVM_ROOT_REMOTE}' LLVM_INSTALL_DIR='${LLVM_ROOT_REMOTE}' LLVM_ROOT='${LLVM_ROOT_REMOTE}'; rm -rf '${HACC_DIR}/build' && cmake -S '${HACC_DIR}' -B '${HACC_DIR}/build' -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=clang++ && cmake --build '${HACC_DIR}/build' -j"
+}
+
+BASELINE_BIN="${HACC_DIR}/build/testhacc_io"
+OMPFILE_BIN="${HACC_DIR}/build/testhacc_ompfile"
+
+if [[ "${BUILD_HACC}" == "1" || ! -x "${BASELINE_BIN}" || ! -x "${OMPFILE_BIN}" ]]; then
+  echo "[amd-hacc-io-cmp] building hacc-io-fork (container cmake)"
+  in_container_build
+fi
+if [[ ! -x "${BASELINE_BIN}" || ! -x "${OMPFILE_BIN}" ]]; then
+  echo "Error: hacc-io binaries missing after build (${BASELINE_BIN}, ${OMPFILE_BIN})." >&2
+  exit 1
+fi
+
+collect_summary() { # log_file mode
+  local line
+  line="$(grep -ao 'HACC_IO_SUMMARY .*' "$1" | tail -1)"
+  if [[ -z "${line}" ]]; then
+    echo "Error: no HACC_IO_SUMMARY in $1" >&2
+    tail -n 40 "$1" >&2
+    exit 1
+  fi
+  local get
+  get() { echo "${line}" | grep -oE "$1=[^ ]+" | head -1 | cut -d= -f2; }
+  echo "$2,$(get interface),$(get logical_ranks),$(get particles_per_rank),$(get bytes),$(get write_s),$(get write_mib_s),$(get read_s),$(get read_mib_s),$(get verified)" >> "${SUMMARY_CSV}"
+}
+
+# Role script: every rank re-enters the container with the PMIx server bind
+# and the host-MPI lib override, then execs its target binary. Modeled on
+# application/benchmarks/ooc-cholesky-io/run.sh.
+write_role_script() { # path env_stmt role_case ("baseline" runs app on every rank)
+  local role_path="$1" env_stmt="$2" role_case="$3"
+  cat > "${role_path}" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+${env_stmt}
+
+run_in_container() {
+  local target_bin="\$1"
+  local binds="${PROJECT_ROOT}:${PROJECT_ROOT},${REPO_ROOT}:${REPO_ROOT},${COMPARE_OUTDIR}:${COMPARE_OUTDIR},/tmp:/tmp,/dev/shm:/dev/shm"
+  if [[ -d /work1 ]]; then binds="\${binds},/work1:/work1"; fi
+  if [[ -n "\${PMIX_SERVER_TMPDIR:-}" ]]; then
+    pmix_dir="\$(dirname "\${PMIX_SERVER_TMPDIR}")"
+    if [[ -d "\${pmix_dir}" ]]; then binds="\${binds},\${pmix_dir}:\${pmix_dir}"; fi
+  elif [[ -d /var/spool/slurmd ]]; then
+    binds="\${binds},/var/spool/slurmd:/var/spool/slurmd"
+  fi
+  if [[ -d "\${HOME}" ]]; then binds="\${binds},\${HOME}:\${HOME}"; fi
+  if [[ -d /opt ]]; then binds="\${binds},/opt:/opt"; fi
+  APPTAINER_DISABLE_CACHE=1 exec apptainer exec \\
+    --userns --no-privs \\
+    --bind "\${binds}" \\
+    "${CONTAINER_IMAGE}" \\
+    /bin/bash -lc "source \"${REPO_ROOT}/sh-scripts/set_env.sh\" \"${LLVM_ROOT_REMOTE}\" >/dev/null && export LLVM_BUILD_DIR=\"${LLVM_ROOT_REMOTE}\" LLVM_INSTALL_DIR=\"${LLVM_ROOT_REMOTE}\" LLVM_ROOT=\"${LLVM_ROOT_REMOTE}\" && export LD_LIBRARY_PATH=\"${MPI_LIB_OVERRIDE}:\\\${LD_LIBRARY_PATH}\"; exec \"\${target_bin}\""
+}
+
+${role_case}
+EOF
+  chmod +x "${role_path}"
+}
+
+run_baseline() { # mode (posix|mpiio)
+  local mode="$1"
+  local ifname="posix-pwrite"
+  [[ "${mode}" == "mpiio" ]] && ifname="mpiio"
+  local log_file="${COMPARE_OUTDIR}/${mode}.log"
+  local data_path="${COMPARE_OUTDIR}/data-${mode}"
+  local role_path="${COMPARE_OUTDIR}/role-${mode}.sh"
+  echo "[amd-hacc-io-cmp] baseline ${mode} (${COMPARE_TASKS} SPMD ranks)"
+  # run_in_container execs the target directly — wrap binary+args in a helper:
+  cat > "${COMPARE_OUTDIR}/exec-${mode}.sh" <<EOF
+#!/usr/bin/env bash
+exec "${BASELINE_BIN}" "${COMPARE_PARTICLES}" "${data_path}"
+EOF
+  chmod +x "${COMPARE_OUTDIR}/exec-${mode}.sh"
+  write_role_script "${role_path}" \
+    "export HACC_IO_INTERFACE=${ifname}" \
+    "run_in_container \"${COMPARE_OUTDIR}/exec-${mode}.sh\""
+  srun --kill-on-bad-exit=1 --mpi="${RUN_MPI_TYPE}" --nodes="${SLURM_JOB_NUM_NODES}" --ntasks="${COMPARE_TASKS}" --ntasks-per-node=1 \
+    "${role_path}" > "${log_file}" 2>&1 || { echo "Error: baseline ${mode} failed" >&2; tail -n 40 "${log_file}" >&2; exit 1; }
+  grep -q 'CONTENTS VERIFIED' "${log_file}" || { echo "Error: baseline ${mode} did not verify" >&2; tail -n 40 "${log_file}" >&2; exit 1; }
+  collect_summary "${log_file}" "${mode}"
+  if [[ "${COMPARE_CLEAN_DATA}" == "1" ]]; then
+    rm -f "${data_path}"*
+  fi
+}
+
+run_ompfile() { # mode (ompfile-wt|ompfile-wb) extra_env_stmt
+  local mode="$1"
+  local extra_env="$2"
+  local log_file="${COMPARE_OUTDIR}/${mode}.log"
+  local data_path="${COMPARE_OUTDIR}/data-${mode}"
+  local role_path="${COMPARE_OUTDIR}/role-${mode}.sh"
+  echo "[amd-hacc-io-cmp] ${mode} split-role (1 app + $((COMPARE_TASKS - 1)) proxies, logical_ranks=${COMPARE_TASKS})"
+  cat > "${COMPARE_OUTDIR}/exec-app-${mode}.sh" <<EOF
+#!/usr/bin/env bash
+export HACC_FILE="${data_path}" HACC_RANKS="${COMPARE_TASKS}" HACC_PARTICLES="${COMPARE_PARTICLES}"
+exec "${OMPFILE_BIN}"
+EOF
+  chmod +x "${COMPARE_OUTDIR}/exec-app-${mode}.sh"
+  write_role_script "${role_path}" \
+    "export OMP_TARGET_OFFLOAD=MANDATORY
+export OMPTARGET_DISABLE_HOST_PLUGIN=1
+export LIBOMPFILE_BACKEND=MPI
+export LIBOMPFILE_MPP_OPEN=1
+export LIBOMPFILE_MPP_IO=1
+export LIBOMPFILE_MPP_PING=1
+export LIBOMPFILE_SCHEDULER=${OMPFILE_SCHEDULER}
+export LIBOMPFILE_OPT_OPEN_CACHE=1
+export LIBOMPFILE_OPT_OPEN_CACHE_KEEP_OPEN=1
+export LIBOMPFILE_OPT_STATS=1
+export UCX_TLS=\${UCX_TLS:-all}
+export UCX_POSIX_USE_PROC_LINK=\${UCX_POSIX_USE_PROC_LINK:-n}
+${extra_env}" \
+    "if [[ \"\${SLURM_PROCID}\" -eq \$((SLURM_NTASKS - 1)) ]]; then
+  run_in_container \"${COMPARE_OUTDIR}/exec-app-${mode}.sh\"
+else
+  run_in_container \"${PROXY_BIN}\"
+fi"
+  srun --kill-on-bad-exit=1 --mpi="${RUN_MPI_TYPE}" --nodes="${SLURM_JOB_NUM_NODES}" --ntasks="${COMPARE_TASKS}" --ntasks-per-node=1 \
+    "${role_path}" > "${log_file}" 2>&1 || { echo "Error: ${mode} failed" >&2; tail -n 60 "${log_file}" >&2; exit 1; }
+  grep -q 'CONTENTS VERIFIED' "${log_file}" || { echo "Error: ${mode} did not verify" >&2; tail -n 60 "${log_file}" >&2; exit 1; }
+  collect_summary "${log_file}" "${mode}"
+  if [[ "${COMPARE_CLEAN_DATA}" == "1" ]]; then
+    rm -f "${data_path}"*
+  fi
+}
+
+# Topology for the write-back lane: node-local stage on proxy hosts,
+# authoritative storage on wekafs (/work1).
+TOPOLOGY_FILE="${COMPARE_OUTDIR}/topology.txt"
+{
+  echo "global /work1 parallel_fs"
+  scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -n $((COMPARE_TASKS - 1)) | while read -r host; do
+    echo "host ${host} /tmp/${USER}/libompfile-stage/hacc-${SLURM_JOB_ID} local-posix"
+  done
+} > "${TOPOLOGY_FILE}"
+
+WB_ENV="export LIBOMPFILE_STAGE_MODE=readthrough
+export LIBOMPFILE_STAGE_ROOT_POLICY=topology
+export LIBOMPFILE_TOPOLOGY_FILE=${TOPOLOGY_FILE}
+export LIBOMPFILE_STAGE_WRITE_MODE=write-back
+export LIBOMPFILE_STAGE_DIRTY_WATERMARK_BYTES=8388608
+export LIBOMPFILE_WRITETHROUGH_FSYNC_POLICY=close"
+WT_ENV="export LIBOMPFILE_STAGE_MODE=off
+export LIBOMPFILE_WRITETHROUGH_FSYNC_POLICY=each"
+
+MODE_LIST="${COMPARE_MODES_RAW//,/ }"
+for mode in ${MODE_LIST}; do
+  case "${mode}" in
+    posix|mpiio) run_baseline "${mode}" ;;
+    ompfile-wt) run_ompfile ompfile-wt "${WT_ENV}" ;;
+    ompfile-wb) run_ompfile ompfile-wb "${WB_ENV}" ;;
+    *) echo "Error: unsupported mode '${mode}' in HACC_COMPARE_MODES." >&2; exit 1 ;;
+  esac
+done
+
+echo "[amd-hacc-io-cmp] summary:"
+cat "${SUMMARY_CSV}"
+
+awk -F, 'NR > 1 {
+  gsub(/-/, "_", $1);
+  w[$1] = $7; r[$1] = $9; v[$1] = $10; bytes = $5; ranks = $3; particles = $4;
+}
+END {
+  printf "SPINNER_HACC_IO tasks=%s particles_per_rank=%s bytes=%s", ranks, particles, bytes;
+  for (m in w) printf " write_mib_%s=%s read_mib_%s=%s verified_%s=%s", m, w[m], m, r[m], m, v[m];
+  printf "\n";
+}' "${SUMMARY_CSV}"
+
+echo "[amd-hacc-io-cmp] status=PASS summary_csv=${SUMMARY_CSV}"

@@ -279,7 +279,11 @@ int RestartIO_GLEAN :: __MPIIO_Create (void )
         retval = MPI_File_open(MPI_COMM_SELF, (char *)m_partFileName,
                                MPI_MODE_WRONLY | MPI_MODE_CREATE,
                                MPI_INFO_NULL,&m_fileHandle);
-        assert(retval == MPI_SUCCESS);
+        if (retval != MPI_SUCCESS)
+        {
+            __HandleMPIIOError(retval, (char *)"MPI_File_open create");
+            MPI_Abort(m_partitionComm, retval);
+        }
         
         if (1 == m_preallocFile)
         {
@@ -301,7 +305,11 @@ int RestartIO_GLEAN :: __MPIIO_Create (void )
                            MPI_MODE_WRONLY,
                            MPI_INFO_NULL,
                            &m_fileHandle);
-    assert(retval == MPI_SUCCESS);
+    if (retval != MPI_SUCCESS)
+    {
+        __HandleMPIIOError(retval, (char *)"MPI_File_open write");
+        MPI_Abort(m_partitionComm, retval);
+    }
     
     MPI_Barrier (m_partitionComm);
     
@@ -437,7 +445,11 @@ int RestartIO_GLEAN :: __MPIIO_Open_Restart(void)
                           MPI_MODE_RDONLY,
                           MPI_INFO_NULL,
                           &m_fileHandle);
-   assert(status == MPI_SUCCESS);
+   if (status != MPI_SUCCESS)
+   {
+       __HandleMPIIOError(status, (char *)"MPI_File_open restart");
+       MPI_Abort(m_partitionComm, status);
+   }
    
    MPI_Barrier (m_partitionComm);
    

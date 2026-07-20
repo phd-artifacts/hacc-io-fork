@@ -73,15 +73,29 @@ int main (int argc, char * argv[])
     
     rst->Initialize(MPI_COMM_WORLD);
 
-    //rst->SetPOSIX_IO_Interface(1);
-    rst->SetPOSIX_IO_Interface();
+    // Interface selection via HACC_IO_INTERFACE: posix (read/write),
+    // posix-pwrite (pread/pwrite), mpiio (default upstream). Local fork
+    // addition for the backend-compare lanes.
+    const char* io_if = getenv("HACC_IO_INTERFACE");
+    if (io_if && 0 == strcmp(io_if, "mpiio"))
+        rst->SetMPI_IO_Interface();
+    else if (io_if && 0 == strcmp(io_if, "posix-pwrite"))
+        rst->SetPOSIX_IO_Interface(1);
+    else
+        rst->SetPOSIX_IO_Interface();
+
+    double hacc_write_s = 0.0, hacc_read_s = 0.0, hacc_t0 = 0.0;
 
 #ifndef HACC_IO_DISABLE_WRITE
+    MPI_Barrier(MPI_COMM_WORLD);
+    hacc_t0 = MPI_Wtime();
     rst->CreateCheckpoint (fname, num_particles);
     
     rst->Write(xx, yy, zz, vx, vy, vz, phi, pid, mask);
         
     rst->Close();
+    MPI_Barrier(MPI_COMM_WORLD);
+    hacc_write_s = MPI_Wtime() - hacc_t0;
 #endif
 
 #ifndef HACC_IO_DISABLE_READ
@@ -92,6 +106,8 @@ int main (int argc, char * argv[])
     uint16_t* mask_r;
     int64_t my_particles;
     
+    MPI_Barrier(MPI_COMM_WORLD);
+    hacc_t0 = MPI_Wtime();
     my_particles  = rst->OpenRestart (fname);
     
     if (my_particles != num_particles)
@@ -103,6 +119,8 @@ int main (int argc, char * argv[])
     rst->Read( xx_r, yy_r, zz_r, vx_r, vy_r, vz_r, phi_r, pid_r, mask_r);
 
     rst->Close();
+    MPI_Barrier(MPI_COMM_WORLD);
+    hacc_read_s = MPI_Wtime() - hacc_t0;
 
 #ifndef HACC_IO_DISABLE_WRITE
     // Verify the contents if we have the original values stored in memory
@@ -131,6 +149,28 @@ int main (int argc, char * argv[])
         cout << " CONTENTS VERIFIED... Success " << endl;
 #endif
 #endif
+
+    // Machine-parseable summary (fork addition): aggregate bytes across
+    // ranks, phase times are barrier-to-barrier maxima.
+    {
+        const int64_t record_bytes = 7 * (int64_t)sizeof(float)
+            + sizeof(int64_t) + sizeof(uint16_t);
+        const int64_t total_bytes =
+            (int64_t)numtasks * num_particles * record_bytes;
+        if (0 == myrank)
+        {
+            const double wmib = hacc_write_s > 0.0
+                ? (double)total_bytes / (1024.0 * 1024.0) / hacc_write_s : 0.0;
+            const double rmib = hacc_read_s > 0.0
+                ? (double)total_bytes / (1024.0 * 1024.0) / hacc_read_s : 0.0;
+            printf("HACC_IO_SUMMARY interface=%s logical_ranks=%d "
+                   "particles_per_rank=%lld bytes=%lld write_s=%.6f "
+                   "write_mib_s=%.3f read_s=%.6f read_mib_s=%.3f verified=1\n",
+                   (io_if && *io_if) ? io_if : "posix", numtasks,
+                   (long long)num_particles, (long long)total_bytes,
+                   hacc_write_s, wmib, hacc_read_s, rmib);
+        }
+    }
     
     rst->Finalize();
 
