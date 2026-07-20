@@ -28,10 +28,13 @@ cascade of "Invalid file handle" writes) now report via
 - `CMakeLists.txt`: builds both drivers (`testhacc_io` needs MPI CXX;
   `testhacc_ompfile` needs the repo LLVM toolchain + libompfile).
 - `run_sorgan_hacc_io_compare.sbatch` / `run_amd_hacc_io_compare.sbatch`:
-  four-lane backend compare in one allocation — `posix`, `mpiio` (N SPMD
-  ranks), `ompfile-wt` (write-through, fsync-per-write), `ompfile-wb`
-  (readthrough staging + write-back capture + fsync-policy close). Driven by
-  the `hacc-io-smoke` / `hacc-io` spinner levels in
+  backend compare in one allocation — `posix`, `mpiio` (N SPMD ranks),
+  `ompfile-wt` (write-through, fsync-per-write), `ompfile-wb` (readthrough
+  staging + write-back capture + fsync-policy close), plus concurrent-issue
+  variants `ompfile-wt-conc` / `ompfile-wb-conc` (`HACC_CONCURRENCY` issuer
+  threads over logical ranks, default one per logical rank via
+  `HACC_COMPARE_CONCURRENCY`, attacking the single-issuer per-op transport
+  ceiling). Driven by the `hacc-io-smoke` / `hacc-io` spinner levels in
   `tools/sorgan_remote.sh` / `tools/amd_remote.sh`
   (`spinner/level-1-hacc-io/`).
 

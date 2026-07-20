@@ -50,6 +50,9 @@ COMPARE_PARTICLES="${HACC_COMPARE_PARTICLES:-2000000}"
 COMPARE_TASKS="${HACC_COMPARE_TASKS:-${SLURM_NTASKS}}"
 COMPARE_OUTDIR="${HACC_COMPARE_OUTDIR:-${HACC_DIR}/tmp/backend-compare-amd-${SLURM_JOB_ID}}"
 COMPARE_CLEAN_DATA="${HACC_COMPARE_CLEAN_DATA:-1}"
+# Concurrent-issue lanes: issuer threads over logical ranks (default = one
+# issuer per logical rank, matching the SPMD baselines' concurrency).
+COMPARE_CONCURRENCY="${HACC_COMPARE_CONCURRENCY:-${COMPARE_TASKS}}"
 BUILD_HACC="${HACC_BUILD:-1}"
 OMPFILE_SCHEDULER="${HACC_OMPFILE_SCHEDULER:-${LIBOMPFILE_SCHEDULER:-HEADNODE}}"
 RUN_MPI_TYPE="${RUN_MPI_TYPE:-pmix}"
@@ -185,16 +188,18 @@ EOF
   fi
 }
 
-run_ompfile() { # mode (ompfile-wt|ompfile-wb) extra_env_stmt
+run_ompfile() { # mode (ompfile-wt|ompfile-wb[-conc]) extra_env_stmt [concurrency]
   local mode="$1"
   local extra_env="$2"
+  local conc="${3:-1}"
   local log_file="${COMPARE_OUTDIR}/${mode}.log"
   local data_path="${COMPARE_OUTDIR}/data-${mode}"
   local role_path="${COMPARE_OUTDIR}/role-${mode}.sh"
-  echo "[amd-hacc-io-cmp] ${mode} split-role (1 app + $((COMPARE_TASKS - 1)) proxies, logical_ranks=${COMPARE_TASKS})"
+  echo "[amd-hacc-io-cmp] ${mode} split-role (1 app + $((COMPARE_TASKS - 1)) proxies, logical_ranks=${COMPARE_TASKS}, concurrency=${conc})"
   cat > "${COMPARE_OUTDIR}/exec-app-${mode}.sh" <<EOF
 #!/usr/bin/env bash
 export HACC_FILE="${data_path}" HACC_RANKS="${COMPARE_TASKS}" HACC_PARTICLES="${COMPARE_PARTICLES}"
+export HACC_CONCURRENCY="${conc}"
 exec "${OMPFILE_BIN}"
 EOF
   chmod +x "${COMPARE_OUTDIR}/exec-app-${mode}.sh"
@@ -249,8 +254,10 @@ MODE_LIST="${COMPARE_MODES_RAW//,/ }"
 for mode in ${MODE_LIST}; do
   case "${mode}" in
     posix|mpiio) run_baseline "${mode}" ;;
-    ompfile-wt) run_ompfile ompfile-wt "${WT_ENV}" ;;
-    ompfile-wb) run_ompfile ompfile-wb "${WB_ENV}" ;;
+    ompfile-wt) run_ompfile ompfile-wt "${WT_ENV}" 1 ;;
+    ompfile-wb) run_ompfile ompfile-wb "${WB_ENV}" 1 ;;
+    ompfile-wt-conc) run_ompfile ompfile-wt-conc "${WT_ENV}" "${COMPARE_CONCURRENCY}" ;;
+    ompfile-wb-conc) run_ompfile ompfile-wb-conc "${WB_ENV}" "${COMPARE_CONCURRENCY}" ;;
     *) echo "Error: unsupported mode '${mode}' in HACC_COMPARE_MODES." >&2; exit 1 ;;
   esac
 done

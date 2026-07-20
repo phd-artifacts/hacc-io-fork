@@ -13,14 +13,20 @@
 // verification is bit-exact.
 //
 // Env knobs:
-//   HACC_RANKS      logical SPMD ranks to emulate (default 8)
-//   HACC_PARTICLES  particles per logical rank (default 1000000)
-//   HACC_FILE       checkpoint path (required)
-//   HACC_SKIP_READ  1 = write phase only
+//   HACC_RANKS        logical SPMD ranks to emulate (default 8)
+//   HACC_PARTICLES    particles per logical rank (default 1000000)
+//   HACC_FILE         checkpoint path (required)
+//   HACC_SKIP_READ    1 = write phase only
+//   HACC_CONCURRENCY  concurrent issuer threads over logical ranks (default 1
+//                     = sequential; clamped to HACC_RANKS). Concurrent host
+//                     threads on one handle are the sanctioned libompfile
+//                     pattern (see test-write-batch-overlap-order); disjoint
+//                     per-rank ranges, so no app-level ordering is needed.
 //
 // Output: one machine-parseable line
 //   HACC_IO_SUMMARY interface=ompfile logical_ranks=.. particles_per_rank=..
 //     bytes=.. write_s=.. write_mib_s=.. read_s=.. read_mib_s=.. verified=..
+//     concurrency=..
 
 #include <cerrno>
 #include <cinttypes>
@@ -121,19 +127,54 @@ static int rank_block_io(int handle, int64_t base, RankBuffers &b, int64_t n,
   return 0;
 }
 
-static int verify_rank(const RankBuffers &w, const RankBuffers &r, int64_t n,
-                       int logical_rank) {
+// Verify against the deterministic fill pattern without a second buffer.
+static int verify_rank(const RankBuffers &r, int64_t n, int logical_rank) {
   for (int64_t i = 0; i < n; ++i) {
-    if (w.xx[i] != r.xx[i] || w.yy[i] != r.yy[i] || w.zz[i] != r.zz[i] ||
-        w.vx[i] != r.vx[i] || w.vy[i] != r.vy[i] || w.vz[i] != r.vz[i] ||
-        w.phi[i] != r.phi[i] || w.pid[i] != r.pid[i] ||
-        w.mask[i] != r.mask[i]) {
+    const float f = (float)i;
+    if (r.xx[i] != f || r.yy[i] != f || r.zz[i] != f || r.vx[i] != f ||
+        r.vy[i] != f || r.vz[i] != f || r.phi[i] != f || r.pid[i] != i ||
+        r.mask[i] != (uint16_t)logical_rank) {
       fprintf(stderr, "FAIL hacc-ompfile verify rank=%d index=%" PRId64 "\n",
               logical_rank, i);
       return 1;
     }
   }
   return 0;
+}
+
+// One checkpoint (write) or restart (read+verify) phase: the logical-rank
+// loop, issued by `conc` concurrent host threads with per-thread buffers.
+// Returns 0 on success.
+static int run_phase(int handle, int64_t ranks, int64_t particles,
+                     int64_t rank_bytes, int conc, bool writing) {
+  int failed = 0;
+#pragma omp parallel num_threads(conc) shared(failed)
+  {
+    RankBuffers buf(particles);
+#pragma omp for schedule(dynamic)
+    for (int64_t lr = 0; lr < ranks; ++lr) {
+      int stop = 0;
+#pragma omp atomic read
+      stop = failed;
+      if (stop)
+        continue;
+      const int64_t base = kHeaderBytes + lr * rank_bytes;
+      int rc;
+      if (writing) {
+        fill_rank(buf, particles, (int)lr);
+        rc = rank_block_io(handle, base, buf, particles, /*writing=*/true);
+      } else {
+        rc = rank_block_io(handle, base, buf, particles, /*writing=*/false);
+        if (rc == 0)
+          rc = verify_rank(buf, particles, (int)lr);
+      }
+      if (rc != 0) {
+#pragma omp atomic write
+        failed = 1;
+      }
+    }
+  }
+  return failed;
 }
 
 // Kick the offload runtime so the MPI proxy plugin initializes and the
@@ -156,6 +197,11 @@ int main() {
   const int64_t ranks = env_i64("HACC_RANKS", 8);
   const int64_t particles = env_i64("HACC_PARTICLES", 1000000);
   const int skip_read = (int)env_i64("HACC_SKIP_READ", 0);
+  int concurrency = (int)env_i64("HACC_CONCURRENCY", 1);
+  if (concurrency > ranks)
+    concurrency = (int)ranks;
+  if (concurrency < 1)
+    concurrency = 1;
   const int64_t rank_bytes = particles * kRecordBytes;
   const int64_t total_bytes = ranks * rank_bytes;
   const int64_t file_bytes = kHeaderBytes + total_bytes;
@@ -191,13 +237,9 @@ int main() {
     return 1;
   }
 
-  RankBuffers wbuf(particles);
-  for (int lr = 0; lr < ranks; ++lr) {
-    fill_rank(wbuf, particles, lr);
-    const int64_t base = kHeaderBytes + (int64_t)lr * rank_bytes;
-    if (rank_block_io(handle, base, wbuf, particles, /*writing=*/true) != 0)
-      return 1;
-  }
+  if (run_phase(handle, ranks, particles, rank_bytes, concurrency,
+                /*writing=*/true) != 0)
+    return 1;
 
   if (omp_file_close(handle) != 0) {
     fprintf(stderr, "FAIL hacc-ompfile close errno=%d (%s)\n", errno,
@@ -216,15 +258,9 @@ int main() {
       fprintf(stderr, "FAIL hacc-ompfile restart open errno=%d\n", errno);
       return 1;
     }
-    RankBuffers rbuf(particles);
-    for (int lr = 0; lr < ranks; ++lr) {
-      const int64_t base = kHeaderBytes + (int64_t)lr * rank_bytes;
-      if (rank_block_io(handle, base, rbuf, particles, /*writing=*/false) != 0)
-        return 1;
-      fill_rank(wbuf, particles, lr);
-      if (verify_rank(wbuf, rbuf, particles, lr) != 0)
-        verified = 0;
-    }
+    if (run_phase(handle, ranks, particles, rank_bytes, concurrency,
+                  /*writing=*/false) != 0)
+      verified = 0;
     if (omp_file_close(handle) != 0) {
       fprintf(stderr, "FAIL hacc-ompfile restart close errno=%d\n", errno);
       return 1;
@@ -240,9 +276,9 @@ int main() {
   printf("HACC_IO_SUMMARY interface=ompfile logical_ranks=%" PRId64
          " particles_per_rank=%" PRId64 " bytes=%" PRId64
          " write_s=%.6f write_mib_s=%.3f read_s=%.6f read_mib_s=%.3f "
-         "verified=%d\n",
+         "verified=%d concurrency=%d\n",
          ranks, particles, total_bytes, write_s, write_mib, read_s, read_mib,
-         verified);
+         verified, concurrency);
   printf(" CONTENTS VERIFIED... Success \n"); // match upstream success marker
   return 0;
 }
