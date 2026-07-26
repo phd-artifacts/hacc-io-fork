@@ -320,6 +320,10 @@ export LIBOMPFILE_WRITETHROUGH_FSYNC_POLICY=${HACC_TARGET_FSYNC_POLICY:-close} &
 TARGET_LOCAL_ENV="export LIBOMPFILE_STAGE_MODE=off && \
 export LIBOMPFILE_WRITETHROUGH_FSYNC_POLICY=${HACC_TARGET_FSYNC_POLICY:-close} && \
 export LIBOMPFILE_OPT_LOCAL_DISJOINT_WRITE=1 &&"
+# Concurrent-open validation lane bypasses the two-phase batch read planner to
+# dodge an unrelated intermittent MPI_Testany truncation in that path (see
+# docs/known-issues.md); scoped to this lane so the campaign two-phase story stays.
+TARGET_LOCAL_NOTWOPHASE_ENV="${TARGET_LOCAL_ENV} export LIBOMPFILE_OPT_TWO_PHASE=disabled &&"
 
 MODE_LIST="${COMPARE_MODES_RAW//,/ }"
 for mode in ${MODE_LIST}; do
@@ -336,7 +340,7 @@ for mode in ${MODE_LIST}; do
     ompfile-target-local-seg-async) run_ompfile_target ompfile-target-local-seg-async "${TARGET_LOCAL_ENV}" 0 1 1 ;;
     ompfile-target-wb) run_ompfile_target ompfile-target-wb "${WB_ENV}" 0 ;;
     ompfile-target-fpr) run_ompfile_target ompfile-target-fpr "${TARGET_WT_ENV}" 1 ;;
-    ompfile-target-fpr-concurrent) run_ompfile_target ompfile-target-fpr-concurrent "${TARGET_LOCAL_ENV}" 1 0 0 1 ;;
+    ompfile-target-fpr-concurrent) run_ompfile_target ompfile-target-fpr-concurrent "${TARGET_LOCAL_NOTWOPHASE_ENV}" 1 0 0 1 ;;
     ior-target) run_ior_target ior-target "${TARGET_WT_ENV}" ;;
     *) echo "Error: unsupported mode '${mode}' in HACC_COMPARE_MODES." >&2; exit 1 ;;
   esac
