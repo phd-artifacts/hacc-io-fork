@@ -1142,11 +1142,20 @@ int RestartIO_GLEAN :: __MPIIO_Close_Checkpoint (void)
         }
     }
     
+    // Storage-fair comparison: HACC_FSYNC_ON_CLOSE=1 forces the collective
+    // buffers to the backend before close so the reported write time reflects
+    // storage commit, not just page-cache fill (matches the OMPFILE modes,
+    // which commit at logical close under the "close" fsync policy).
+    {
+        const char *fsync_env = getenv("HACC_FSYNC_ON_CLOSE");
+        if (fsync_env && fsync_env[0] == '1')
+            MPI_File_sync(m_fileHandle);
+    }
     errcode  = MPI_File_close(&m_fileHandle);
     assert (errcode == MPI_SUCCESS);
-    
+
     MPI_Barrier(m_partitionComm);
-    
+
     m_endTime = MPI_Wtime();
 
     return 0;
@@ -1195,19 +1204,25 @@ int RestartIO_GLEAN :: __POSIX_Close_Checkpoint (void)
         }
     }
     MPI_Barrier(m_partitionComm);
-    
+
+    // Storage-fair comparison (see __MPIIO_Close_Checkpoint).
+    {
+        const char *fsync_env = getenv("HACC_FSYNC_ON_CLOSE");
+        if (fsync_env && fsync_env[0] == '1')
+            ::fdatasync(m_posixFD);
+    }
     status = ::close (m_posixFD);
     if (status == -1)
     {
         GLEAN_PRINT_PERROR("Error Closing POSIX File %s in Restart \n", \
                            m_partFileName);
     }
-    
+
     // Wait for all clients in partition to close
     MPI_Barrier(m_partitionComm);
-    
+
     m_endTime = MPI_Wtime();
-    
+
     return status;
 }
 

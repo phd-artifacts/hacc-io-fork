@@ -29,15 +29,10 @@ else()
   message(WARNING "MPI CXX not found; skipping testhacc_io baseline target")
 endif()
 
-# ---- OMPFILE split-role variant (MPI-free; offload warmup) ----------------
-add_executable(testhacc_ompfile testhacc_ompfile.cc)
-target_include_directories(testhacc_ompfile PRIVATE
-  "${REPO_ROOT}/llvm-infra/llvm-project/openmp/libompfile/include")
-target_compile_options(testhacc_ompfile PRIVATE
-  -fopenmp -fopenmp-targets=x86_64-pc-linux-gnu)
-target_link_options(testhacc_ompfile PRIVATE
-  -fopenmp -fopenmp-targets=x86_64-pc-linux-gnu)
-
+# ---- OMPFILE split-role variants (MPI-free; offload warmup) ----------------
+# testhacc_ompfile: single-app-rank issuer (funnel posture)
+# testhacc_target:  distributed issuers via target regions (fair posture)
+# testior_target:   IOR -F geometry via target regions (fair posture)
 set(OMPFILE_SEARCH_DIRS
   "${LLVM_BUILD_ROOT}/lib"
   "${LLVM_BUILD_ROOT}/lib/x86_64-unknown-linux-gnu"
@@ -50,10 +45,19 @@ find_library(OMPFILE_LIBRARY NAMES ompfile PATHS ${OMPFILE_SEARCH_DIRS})
 if(NOT OMPFILE_LIBRARY)
   message(FATAL_ERROR "Could not find libompfile.so in: ${OMPFILE_SEARCH_DIRS}")
 endif()
-target_link_libraries(testhacc_ompfile PRIVATE "${OMPFILE_LIBRARY}")
 
-foreach(_dir IN LISTS OMPFILE_SEARCH_DIRS)
-  if(EXISTS "${_dir}")
-    target_link_libraries(testhacc_ompfile PRIVATE "-Wl,-rpath,${_dir}")
-  endif()
+foreach(_ompfile_bin IN ITEMS testhacc_ompfile testhacc_target testior_target)
+  add_executable(${_ompfile_bin} ${_ompfile_bin}.cc)
+  target_include_directories(${_ompfile_bin} PRIVATE
+    "${REPO_ROOT}/llvm-infra/llvm-project/openmp/libompfile/include")
+  target_compile_options(${_ompfile_bin} PRIVATE
+    -fopenmp -fopenmp-targets=x86_64-pc-linux-gnu)
+  target_link_options(${_ompfile_bin} PRIVATE
+    -fopenmp -fopenmp-targets=x86_64-pc-linux-gnu)
+  target_link_libraries(${_ompfile_bin} PRIVATE "${OMPFILE_LIBRARY}")
+  foreach(_dir IN LISTS OMPFILE_SEARCH_DIRS)
+    if(EXISTS "${_dir}")
+      target_link_libraries(${_ompfile_bin} PRIVATE "-Wl,-rpath,${_dir}")
+    endif()
+  endforeach()
 endforeach()
