@@ -375,6 +375,12 @@ export LIBOMPFILE_OPT_LOCAL_DISJOINT_WRITE=1"
 # reads are fine, and this scoping leaves the campaign's two-phase story intact.
 TARGET_LOCAL_NOTWOPHASE_ENV="${TARGET_LOCAL_ENV}
 export LIBOMPFILE_OPT_TWO_PHASE=disabled"
+# Traced reproducer for the two-phase batch-read MPI_Testany truncation
+# (docs/known-issues.md): two-phase stays ENABLED, proxy + headnode tracing on,
+# so a failing run captures the sender/receiver size disagreement.
+TARGET_LOCAL_TWOPHASE_TRACE_ENV="${TARGET_LOCAL_ENV}
+export LIBOMPFILE_FRESHNESS_TRACE=1
+export LIBOMPFILE_DEBUG_TRACE=1"
 
 MODE_LIST="${COMPARE_MODES_RAW//,/ }"
 for mode in ${MODE_LIST}; do
@@ -392,6 +398,7 @@ for mode in ${MODE_LIST}; do
     ompfile-target-wb) run_ompfile_target ompfile-target-wb "${WB_ENV}" 0 ;;
     ompfile-target-fpr) run_ompfile_target ompfile-target-fpr "${TARGET_WT_ENV}" 1 ;;
     ompfile-target-fpr-concurrent) run_ompfile_target ompfile-target-fpr-concurrent "${TARGET_LOCAL_NOTWOPHASE_ENV}" 1 0 0 1 ;;
+    ompfile-target-fpr-concurrent-twophase-trace) run_ompfile_target ompfile-target-fpr-concurrent-twophase-trace "${TARGET_LOCAL_TWOPHASE_TRACE_ENV}" 1 0 0 1 ;;
     ior-target) run_ior_target ior-target "${TARGET_WT_ENV}" ;;
     *) echo "Error: unsupported mode '${mode}' in HACC_COMPARE_MODES." >&2; exit 1 ;;
   esac
