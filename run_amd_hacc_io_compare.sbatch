@@ -378,6 +378,11 @@ export LIBOMPFILE_OPT_LOCAL_DISJOINT_WRITE=1"
 # reads are fine, and this scoping leaves the campaign's two-phase story intact.
 TARGET_LOCAL_NOTWOPHASE_ENV="${TARGET_LOCAL_ENV}
 export LIBOMPFILE_OPT_TWO_PHASE=disabled"
+# Owner-bypass on BOTH directions: disjoint writes go local, and reads of
+# flushed disjoint ranges are served from a local O_RDONLY fd instead of the
+# owner funnel (LIBOMPFILE_OPT_LOCAL_DISJOINT_READ).
+TARGET_LOCAL_RW_ENV="${TARGET_LOCAL_ENV}
+export LIBOMPFILE_OPT_LOCAL_DISJOINT_READ=1"
 # Traced reproducer for the two-phase batch-read MPI_Testany truncation
 # (docs/known-issues.md): two-phase stays ENABLED, proxy + headnode tracing on,
 # so a failing run captures the sender/receiver size disagreement.
@@ -406,6 +411,7 @@ for mode in ${MODE_LIST}; do
     ior-target-shared) run_ior_target ior-target-shared "${TARGET_WT_ENV}" 1 0 ;;
     ior-target-shared-shift) run_ior_target ior-target-shared-shift "${TARGET_WT_ENV}" 1 1 ;;
     ior-target-shared-shift-local) run_ior_target ior-target-shared-shift-local "${TARGET_LOCAL_ENV}" 1 1 ;;
+    ior-target-shared-shift-local-rw) run_ior_target ior-target-shared-shift-local-rw "${TARGET_LOCAL_RW_ENV}" 1 1 ;;
     *) echo "Error: unsupported mode '${mode}' in HACC_COMPARE_MODES." >&2; exit 1 ;;
   esac
 done

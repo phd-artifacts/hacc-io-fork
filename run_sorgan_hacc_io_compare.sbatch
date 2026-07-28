@@ -327,6 +327,8 @@ export LIBOMPFILE_OPT_LOCAL_DISJOINT_WRITE=1 &&"
 # dodge an unrelated intermittent MPI_Testany truncation in that path (see
 # docs/known-issues.md); scoped to this lane so the campaign two-phase story stays.
 TARGET_LOCAL_NOTWOPHASE_ENV="${TARGET_LOCAL_ENV} export LIBOMPFILE_OPT_TWO_PHASE=disabled &&"
+# Owner-bypass on BOTH directions (see AMD variant).
+TARGET_LOCAL_RW_ENV="${TARGET_LOCAL_ENV} && export LIBOMPFILE_OPT_LOCAL_DISJOINT_READ=1"
 
 MODE_LIST="${COMPARE_MODES_RAW//,/ }"
 for mode in ${MODE_LIST}; do
@@ -348,6 +350,7 @@ for mode in ${MODE_LIST}; do
     ior-target-shared) run_ior_target ior-target-shared "${TARGET_WT_ENV}" 1 0 ;;
     ior-target-shared-shift) run_ior_target ior-target-shared-shift "${TARGET_WT_ENV}" 1 1 ;;
     ior-target-shared-shift-local) run_ior_target ior-target-shared-shift-local "${TARGET_LOCAL_ENV}" 1 1 ;;
+    ior-target-shared-shift-local-rw) run_ior_target ior-target-shared-shift-local-rw "${TARGET_LOCAL_RW_ENV}" 1 1 ;;
     *) echo "Error: unsupported mode '${mode}' in HACC_COMPARE_MODES." >&2; exit 1 ;;
   esac
 done
