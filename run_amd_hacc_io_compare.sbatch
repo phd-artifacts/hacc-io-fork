@@ -96,7 +96,7 @@ mkdir -p "${COMPARE_OUTDIR}"
 SUMMARY_CSV="${COMPARE_OUTDIR}/hacc-io-summary.csv"
 echo "mode,interface,logical_ranks,particles_per_rank,bytes,write_s,write_mib_s,read_s,read_mib_s,verified" > "${SUMMARY_CSV}"
 IOR_TARGET_CSV="${COMPARE_OUTDIR}/ior-target-summary.csv"
-echo "mode,writers,devices,transfer_bytes,block_bytes,total_bytes,write_open_s,write_s,write_close_s,write_mib_s,read_open_s,read_s,read_close_s,read_mib_s,verified" > "${IOR_TARGET_CSV}"
+echo "mode,writers,devices,transfer_bytes,block_bytes,total_bytes,shared,read_shift,write_open_s,write_s,write_close_s,write_mib_s,read_open_s,read_s,read_close_s,read_mib_s,verified" > "${IOR_TARGET_CSV}"
 # ior-target geometry (IOR -F equivalents; block matches the AMD IOR lane)
 IORT_TRANSFER_BYTES="${IORT_TRANSFER_BYTES:-1048576}"
 IORT_BLOCK_BYTES="${IORT_BLOCK_BYTES:-134217728}"
@@ -299,19 +299,22 @@ collect_ior_target_summary() { # log_file mode
   fi
   local get
   get() { echo "${line}" | grep -oE "$1=[^ ]+" | head -1 | cut -d= -f2; }
-  echo "$2,$(get writers),$(get devices),$(get transfer_bytes),$(get block_bytes),$(get total_bytes),$(get write_open_s),$(get write_s),$(get write_close_s),$(get write_mib_s),$(get read_open_s),$(get read_s),$(get read_close_s),$(get read_mib_s),$(get verified)" >> "${IOR_TARGET_CSV}"
+  echo "$2,$(get writers),$(get devices),$(get transfer_bytes),$(get block_bytes),$(get total_bytes),$(get shared),$(get read_shift),$(get write_open_s),$(get write_s),$(get write_close_s),$(get write_mib_s),$(get read_open_s),$(get read_s),$(get read_close_s),$(get read_mib_s),$(get verified)" >> "${IOR_TARGET_CSV}"
 }
 
-run_ior_target() { # mode extra_env_stmt
+run_ior_target() { # mode extra_env_stmt [shared] [read_shift]
   local mode="$1"
   local extra_env="$2"
+  local shared="${3:-0}"
+  local read_shift="${4:-0}"
   local log_file="${COMPARE_OUTDIR}/${mode}.log"
   local data_path="${COMPARE_OUTDIR}/data-${mode}"
   local role_path="${COMPARE_OUTDIR}/role-${mode}.sh"
-  echo "[amd-hacc-io-cmp] ${mode} target-region IOR pattern (writers=proxies, transfer=${IORT_TRANSFER_BYTES} block=${IORT_BLOCK_BYTES})"
+  echo "[amd-hacc-io-cmp] ${mode} target-region IOR pattern (writers=proxies, transfer=${IORT_TRANSFER_BYTES} block=${IORT_BLOCK_BYTES} shared=${shared} read_shift=${read_shift})"
   cat > "${COMPARE_OUTDIR}/exec-app-${mode}.sh" <<EOF
 #!/usr/bin/env bash
 export IORT_FILE="${data_path}" IORT_TRANSFER_BYTES="${IORT_TRANSFER_BYTES}" IORT_BLOCK_BYTES="${IORT_BLOCK_BYTES}"
+export IORT_SHARED="${shared}" IORT_READ_SHIFT="${read_shift}"
 exec "${IOR_TARGET_BIN}"
 EOF
   chmod +x "${COMPARE_OUTDIR}/exec-app-${mode}.sh"
@@ -400,6 +403,9 @@ for mode in ${MODE_LIST}; do
     ompfile-target-fpr-concurrent) run_ompfile_target ompfile-target-fpr-concurrent "${TARGET_LOCAL_NOTWOPHASE_ENV}" 1 0 0 1 ;;
     ompfile-target-fpr-concurrent-twophase-trace) run_ompfile_target ompfile-target-fpr-concurrent-twophase-trace "${TARGET_LOCAL_TWOPHASE_TRACE_ENV}" 1 0 0 1 ;;
     ior-target) run_ior_target ior-target "${TARGET_WT_ENV}" ;;
+    ior-target-shared) run_ior_target ior-target-shared "${TARGET_WT_ENV}" 1 0 ;;
+    ior-target-shared-shift) run_ior_target ior-target-shared-shift "${TARGET_WT_ENV}" 1 1 ;;
+    ior-target-shared-shift-local) run_ior_target ior-target-shared-shift-local "${TARGET_LOCAL_ENV}" 1 1 ;;
     *) echo "Error: unsupported mode '${mode}' in HACC_COMPARE_MODES." >&2; exit 1 ;;
   esac
 done

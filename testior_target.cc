@@ -22,6 +22,12 @@
 //   IORT_BLOCK_BYTES     bytes per writer               (default 16 MiB)
 //   IORT_WRITERS         logical writers (default = visible devices)
 //   IORT_SKIP_READ       1 = write phase only
+//   IORT_SHARED          1 = ONE shared file (writer w owns block w's range),
+//                        replicating IOR's shared-file (no -F) layout
+//   IORT_READ_SHIFT      read phase: worker w reads the block written by
+//                        worker (w+shift) %% writers and verifies THAT
+//                        writer's stamps — IOR's -C/reorderTasks semantics,
+//                        the standard client-cache-defeating read posture
 //
 // Output: one machine-parseable line
 //   IOR_TARGET_SUMMARY writers=.. devices=.. transfer_bytes=.. block_bytes=..
@@ -91,9 +97,15 @@ struct PhaseTimes {
 // One full phase (write or read+verify) across all writers: open all handles
 // (timed), run every writer's chunk loop concurrently (timed), close all
 // handles (timed). Returns 0 on success.
+//
+// shared_file: all workers open paths[0]; worker w's data block sits at
+// offset data_writer*block_bytes. read_shift: in the read phase worker w
+// consumes the block worker (w+shift)%writers wrote (per-file mode opens the
+// shifted writer's file), verifying the source writer's stamps.
 static int run_phase(char **paths, int writers, int devices,
-                     int64_t transfer_bytes, int64_t chunks, bool writing,
-                     PhaseTimes *times) {
+                     int64_t transfer_bytes, int64_t chunks,
+                     int64_t block_bytes, bool shared_file, int read_shift,
+                     bool writing, PhaseTimes *times) {
   int *handles = (int *)malloc((size_t)writers * sizeof(int));
   if (!handles)
     return 1;
@@ -102,7 +114,8 @@ static int run_phase(char **paths, int writers, int devices,
   double t = now_s();
   for (int w = 0; w < writers && !failed; ++w) {
     const int device_id = w % devices;
-    const char *path = paths[w];
+    const int data_writer = writing ? w : (w + read_shift) % writers;
+    const char *path = shared_file ? paths[0] : paths[data_writer];
     const size_t path_len = strlen(path) + 1;
     int handle = -1;
     int saved_errno = 0;
@@ -138,11 +151,13 @@ static int run_phase(char **paths, int writers, int devices,
         {
           int rc = 0;
           int saved_errno = 0;
-          const int64_t wr = w;
+          const int64_t wr = writing ? w : (w + read_shift) % writers;
           const int64_t n_chunks = chunks;
           const int64_t chunk_bytes = transfer_bytes;
+          const int64_t base_off = shared_file ? wr * block_bytes : 0;
           const bool is_write = writing;
-#pragma omp target firstprivate(handle, wr, n_chunks, chunk_bytes, is_write)   \
+#pragma omp target firstprivate(handle, wr, n_chunks, chunk_bytes, base_off,   \
+                                    is_write)                                  \
     device(device_id) map(tofrom : rc, saved_errno)
           {
             unsigned char *buf = (unsigned char *)malloc((size_t)chunk_bytes);
@@ -155,7 +170,7 @@ static int run_phase(char **paths, int writers, int devices,
                   buf[i] = (unsigned char)(((wr + 1) * 131 + i) & 0xff);
               }
               for (int64_t c = 0; c < n_chunks && rc == 0; ++c) {
-                const int64_t off = c * chunk_bytes;
+                const int64_t off = base_off + c * chunk_bytes;
                 if (is_write) {
                   *(uint64_t *)buf = chunk_stamp(wr, c);
                   if (omp_file_pwrite(handle, off, buf, (size_t)chunk_bytes,
@@ -236,6 +251,8 @@ int main() {
   const int64_t block_bytes =
       env_i64("IORT_BLOCK_BYTES", 16LL * 1024 * 1024);
   const int skip_read = (int)env_i64("IORT_SKIP_READ", 0);
+  const int shared_file = (int)env_i64("IORT_SHARED", 0);
+  const int read_shift = (int)env_i64("IORT_READ_SHIFT", 0);
   if (block_bytes % transfer_bytes != 0) {
     fprintf(stderr, "FAIL ior-target: block %% transfer != 0\n");
     return 1;
@@ -253,7 +270,8 @@ int main() {
     writers = devices;
   const int64_t total_bytes = (int64_t)writers * block_bytes;
 
-  // Per-writer files, pre-created + truncated app-side (OOC seed pattern).
+  // Files pre-created + truncated app-side (OOC seed pattern): one file of
+  // writers*block bytes in shared mode, else one block-sized file per writer.
   char **paths = (char **)calloc((size_t)writers, sizeof(char *));
   if (!paths)
     return 1;
@@ -262,9 +280,17 @@ int main() {
     paths[w] = (char *)malloc(len);
     if (!paths[w])
       return 1;
-    snprintf(paths[w], len, "%s.%08d", base, w);
+    if (shared_file)
+      snprintf(paths[w], len, "%s", base);
+    else
+      snprintf(paths[w], len, "%s.%08d", base, w);
+    if (shared_file && w > 0)
+      continue;
+    const off_t create_bytes =
+        shared_file ? (off_t)((int64_t)writers * block_bytes)
+                    : (off_t)block_bytes;
     int fd = ::open(paths[w], O_CREAT | O_TRUNC | O_WRONLY, 0644);
-    if (fd < 0 || ::ftruncate(fd, (off_t)block_bytes) != 0) {
+    if (fd < 0 || ::ftruncate(fd, create_bytes) != 0) {
       fprintf(stderr, "FAIL ior-target create writer=%d errno=%d (%s)\n", w,
               errno, strerror(errno));
       if (fd >= 0)
@@ -275,13 +301,15 @@ int main() {
   }
 
   PhaseTimes wt, rt;
-  if (run_phase(paths, writers, devices, transfer_bytes, chunks,
+  if (run_phase(paths, writers, devices, transfer_bytes, chunks, block_bytes,
+                shared_file != 0, read_shift,
                 /*writing=*/true, &wt) != 0)
     return 1;
 
   int verified = skip_read ? -1 : 1;
   if (!skip_read) {
-    if (run_phase(paths, writers, devices, transfer_bytes, chunks,
+    if (run_phase(paths, writers, devices, transfer_bytes, chunks, block_bytes,
+                  shared_file != 0, read_shift,
                   /*writing=*/false, &rt) != 0) {
       verified = 0;
       return 1;
@@ -295,10 +323,12 @@ int main() {
 
   printf("IOR_TARGET_SUMMARY writers=%d devices=%d transfer_bytes=%" PRId64
          " block_bytes=%" PRId64 " total_bytes=%" PRId64
+         " shared=%d read_shift=%d"
          " write_open_s=%.6f write_s=%.6f write_close_s=%.6f "
          "write_mib_s=%.3f read_open_s=%.6f read_s=%.6f read_close_s=%.6f "
          "read_mib_s=%.3f verified=%d\n",
-         writers, devices, transfer_bytes, block_bytes, total_bytes, wt.open_s,
+         writers, devices, transfer_bytes, block_bytes, total_bytes,
+         shared_file, read_shift, wt.open_s,
          wt.io_s, wt.close_s, write_mib, rt.open_s, rt.io_s, rt.close_s,
          read_mib, verified);
   printf(" CONTENTS VERIFIED... Success \n"); // shared success marker
