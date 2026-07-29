@@ -391,7 +391,8 @@ export LIBOMPFILE_OPT_LOCAL_DISJOINT_READ=1"
 # alone moved 47008 B cells only 124->150 MiB/s because the window dominated).
 TARGET_LOCAL_RW_NB_ENV="${TARGET_LOCAL_RW_ENV}
 export LIBOMPFILE_OPT_WRITE_BATCH=disabled
-export LIBOMPFILE_OPT_TWO_PHASE=disabled"
+export LIBOMPFILE_OPT_TWO_PHASE=disabled
+export LIBOMPFILE_OPT_LOCAL_DISJOINT_EXPRESS=1"
 # Coalesced bypass: no-batch plus the proxy-side op-coalescing layer —
 # contiguous small pwrites combine into 16 MiB PFS writes, small preads are
 # served from a 16 MiB readahead window (wekafs charges a ~fixed latency per
