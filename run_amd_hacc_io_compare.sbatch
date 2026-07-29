@@ -383,11 +383,20 @@ export LIBOMPFILE_OPT_TWO_PHASE=disabled"
 # owner funnel (LIBOMPFILE_OPT_LOCAL_DISJOINT_READ).
 TARGET_LOCAL_RW_ENV="${TARGET_LOCAL_ENV}
 export LIBOMPFILE_OPT_LOCAL_DISJOINT_READ=1"
-# Coalesced bypass: same both-direction bypass plus the op-coalescing layer —
+# No-batch bypass: both-direction bypass with the client-side batch windows
+# off. The write-batch and two-phase planners each hold every op in a 2 ms
+# grouping window (kDefault*WindowUs) to merge funnel traffic across ranks —
+# with one writer per proxy and the bypass serving ops locally, nobody joins
+# the batch and the window is a pure fixed per-op tax (job 359353: coalescing
+# alone moved 47008 B cells only 124->150 MiB/s because the window dominated).
+TARGET_LOCAL_RW_NB_ENV="${TARGET_LOCAL_RW_ENV}
+export LIBOMPFILE_OPT_WRITE_BATCH=disabled
+export LIBOMPFILE_OPT_TWO_PHASE=disabled"
+# Coalesced bypass: no-batch plus the proxy-side op-coalescing layer —
 # contiguous small pwrites combine into 16 MiB PFS writes, small preads are
-# served from a 16 MiB readahead window (wekafs charges ~3.5 ms per op
-# regardless of size, so small-op workloads need large PFS ops to compete).
-TARGET_LOCAL_RW_CO_ENV="${TARGET_LOCAL_RW_ENV}
+# served from a 16 MiB readahead window (wekafs charges a ~fixed latency per
+# op, so small-op workloads need large PFS ops to compete).
+TARGET_LOCAL_RW_CO_ENV="${TARGET_LOCAL_RW_NB_ENV}
 export LIBOMPFILE_OPT_LOCAL_DISJOINT_WRITE_COMBINE=${HACC_TARGET_COALESCE_BYTES:-16777216}
 export LIBOMPFILE_OPT_LOCAL_DISJOINT_READAHEAD=${HACC_TARGET_COALESCE_BYTES:-16777216}"
 # Traced reproducer for the two-phase batch-read MPI_Testany truncation
@@ -419,6 +428,7 @@ for mode in ${MODE_LIST}; do
     ior-target-shared-shift) run_ior_target ior-target-shared-shift "${TARGET_WT_ENV}" 1 1 ;;
     ior-target-shared-shift-local) run_ior_target ior-target-shared-shift-local "${TARGET_LOCAL_ENV}" 1 1 ;;
     ior-target-shared-shift-local-rw) run_ior_target ior-target-shared-shift-local-rw "${TARGET_LOCAL_RW_ENV}" 1 1 ;;
+    ior-target-shared-shift-local-rw-nb) run_ior_target ior-target-shared-shift-local-rw-nb "${TARGET_LOCAL_RW_NB_ENV}" 1 1 ;;
     ior-target-shared-shift-local-rw-co) run_ior_target ior-target-shared-shift-local-rw-co "${TARGET_LOCAL_RW_CO_ENV}" 1 1 ;;
     *) echo "Error: unsupported mode '${mode}' in HACC_COMPARE_MODES." >&2; exit 1 ;;
   esac
