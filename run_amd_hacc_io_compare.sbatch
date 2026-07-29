@@ -383,6 +383,13 @@ export LIBOMPFILE_OPT_TWO_PHASE=disabled"
 # owner funnel (LIBOMPFILE_OPT_LOCAL_DISJOINT_READ).
 TARGET_LOCAL_RW_ENV="${TARGET_LOCAL_ENV}
 export LIBOMPFILE_OPT_LOCAL_DISJOINT_READ=1"
+# Coalesced bypass: same both-direction bypass plus the op-coalescing layer —
+# contiguous small pwrites combine into 16 MiB PFS writes, small preads are
+# served from a 16 MiB readahead window (wekafs charges ~3.5 ms per op
+# regardless of size, so small-op workloads need large PFS ops to compete).
+TARGET_LOCAL_RW_CO_ENV="${TARGET_LOCAL_RW_ENV}
+export LIBOMPFILE_OPT_LOCAL_DISJOINT_WRITE_COMBINE=${HACC_TARGET_COALESCE_BYTES:-16777216}
+export LIBOMPFILE_OPT_LOCAL_DISJOINT_READAHEAD=${HACC_TARGET_COALESCE_BYTES:-16777216}"
 # Traced reproducer for the two-phase batch-read MPI_Testany truncation
 # (docs/known-issues.md): two-phase stays ENABLED, proxy + headnode tracing on,
 # so a failing run captures the sender/receiver size disagreement.
@@ -412,6 +419,7 @@ for mode in ${MODE_LIST}; do
     ior-target-shared-shift) run_ior_target ior-target-shared-shift "${TARGET_WT_ENV}" 1 1 ;;
     ior-target-shared-shift-local) run_ior_target ior-target-shared-shift-local "${TARGET_LOCAL_ENV}" 1 1 ;;
     ior-target-shared-shift-local-rw) run_ior_target ior-target-shared-shift-local-rw "${TARGET_LOCAL_RW_ENV}" 1 1 ;;
+    ior-target-shared-shift-local-rw-co) run_ior_target ior-target-shared-shift-local-rw-co "${TARGET_LOCAL_RW_CO_ENV}" 1 1 ;;
     *) echo "Error: unsupported mode '${mode}' in HACC_COMPARE_MODES." >&2; exit 1 ;;
   esac
 done
