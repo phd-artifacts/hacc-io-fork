@@ -421,7 +421,11 @@ int main() {
   // Concurrent fresh-open validation knob: HACC_CONCURRENT_OPEN=1 opens the
   // file-per-rank handles as a concurrent wave (the pattern that used to
   // deadlock) instead of the sequential pre-open workaround. Default 0.
-  const int concurrent_open = (int)env_i64("HACC_CONCURRENT_OPEN", 0);
+  // Default flipped to 1 (Jul 30, 2026): the concurrent fresh-open deadlock
+  // was root-fixed (ENOENT backoff off the single data-event handler) and the
+  // path is guarded by the standing hacc-io-concurrent-open lane; concurrent
+  // opens are the realistic checkpoint pattern. Set 0 to serialize opens.
+  const int concurrent_open = (int)env_i64("HACC_CONCURRENT_OPEN", 1);
   const int64_t rank_bytes = particles * kRecordBytes;
   const int64_t total_bytes = ranks * rank_bytes;
   const int64_t file_bytes = kHeaderBytes + total_bytes;

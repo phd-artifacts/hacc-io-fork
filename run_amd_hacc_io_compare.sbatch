@@ -422,7 +422,7 @@ for mode in ${MODE_LIST}; do
     ompfile-target-local-seg-async) run_ompfile_target ompfile-target-local-seg-async "${TARGET_LOCAL_ENV}" 0 1 1 ;;
     ompfile-target-wb) run_ompfile_target ompfile-target-wb "${WB_ENV}" 0 ;;
     ompfile-target-fpr) run_ompfile_target ompfile-target-fpr "${TARGET_WT_ENV}" 1 ;;
-    ompfile-target-fpr-concurrent) run_ompfile_target ompfile-target-fpr-concurrent "${TARGET_LOCAL_NOTWOPHASE_ENV}" 1 0 0 1 ;;
+    ompfile-target-fpr-concurrent) run_ompfile_target ompfile-target-fpr-concurrent "${TARGET_LOCAL_ENV}" 1 0 0 1 ;;
     ompfile-target-fpr-concurrent-twophase-trace) run_ompfile_target ompfile-target-fpr-concurrent-twophase-trace "${TARGET_LOCAL_TWOPHASE_TRACE_ENV}" 1 0 0 1 ;;
     ior-target) run_ior_target ior-target "${TARGET_WT_ENV}" ;;
     ior-target-shared) run_ior_target ior-target-shared "${TARGET_WT_ENV}" 1 0 ;;
