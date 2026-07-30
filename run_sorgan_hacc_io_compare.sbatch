@@ -112,6 +112,20 @@ if [[ ! -x "${BASELINE_BIN}" || ! -x "${OMPFILE_BIN}" || ! -x "${TARGET_BIN}" ||
 fi
 
 mkdir -p "${COMPARE_OUTDIR}"
+# Optional binds (/scratch, /local) exist on some nodes only — sorgan-cpu6
+# has no /local, and a driver-side [[ -d ]] bakes the driver's mounts into
+# every rank's bind list (job 4186: FATAL mount /local doesn't exist on
+# cpu6). This wrapper decides the optional binds on the executing node.
+APPTAINER_NODE_EXEC="${COMPARE_OUTDIR}/apptainer-node-exec.sh"
+cat > "${APPTAINER_NODE_EXEC}" <<NODE_EXEC
+#!/usr/bin/env bash
+set -euo pipefail
+binds="${REPO_ROOT},/tmp,/dev/shm"
+[[ -d /scratch ]] && binds="\${binds},/scratch"
+[[ -d /local ]] && binds="\${binds},/local"
+exec "${APPTAINER_BIN}" exec --userns --no-privs --bind "\${binds}" "${SIF_IMAGE}" "\$@"
+NODE_EXEC
+chmod +x "${APPTAINER_NODE_EXEC}"
 SUMMARY_CSV="${COMPARE_OUTDIR}/hacc-io-summary.csv"
 echo "mode,interface,logical_ranks,particles_per_rank,bytes,write_s,write_mib_s,read_s,read_mib_s,verified" > "${SUMMARY_CSV}"
 IOR_TARGET_CSV="${COMPARE_OUTDIR}/ior-target-summary.csv"
@@ -144,7 +158,7 @@ run_baseline() { # mode (posix|mpiio)
   local data_path="${COMPARE_OUTDIR}/data-${mode}"
   echo "[hacc-io-cmp] baseline ${mode} (${COMPARE_TASKS} SPMD ranks)"
   srun --kill-on-bad-exit=1 --mpi=pmi2 --nodes="${RUN_NODES}" --ntasks="${COMPARE_TASKS}" \
-    "${APPTAINER_BIN}" exec --userns --no-privs --bind "${APPTAINER_BIND_PATHS}" "${SIF_IMAGE}" \
+    "${APPTAINER_NODE_EXEC}" \
     bash -lc "${COMMON_ENV} && unset LIBOMPFILE_BACKEND LIBOMPFILE_SCHEDULER LIBOMPFILE_MPP_OPEN LIBOMPFILE_MPP_IO LIBOMPFILE_MPP_PING LIBOMPFILE_OPT_OPEN_CACHE LIBOMPFILE_OPT_OPEN_CACHE_KEEP_OPEN LIBOMPFILE_OPT_STATS UCX_TLS UCX_POSIX_USE_PROC_LINK; export HACC_IO_INTERFACE=${ifname}; export HACC_FSYNC_ON_CLOSE=${HACC_BASELINE_FSYNC:-0}; ${BASELINE_BIN} ${COMPARE_PARTICLES} ${data_path}" \
     > "${log_file}" 2>&1 || { echo "Error: baseline ${mode} failed" >&2; tail -n 40 "${log_file}" >&2; exit 1; }
   grep -q 'CONTENTS VERIFIED' "${log_file}" || { echo "Error: baseline ${mode} did not verify" >&2; tail -n 40 "${log_file}" >&2; exit 1; }
@@ -162,7 +176,7 @@ run_ompfile() { # mode (ompfile-wt|ompfile-wb[-conc]) extra_env_stmt [concurrenc
   local data_path="${COMPARE_OUTDIR}/data-${mode}"
   echo "[hacc-io-cmp] ${mode} split-role (1 app + $((COMPARE_TASKS - 1)) proxies, logical_ranks=${COMPARE_TASKS}, concurrency=${conc})"
   srun --kill-on-bad-exit=1 --mpi=pmi2 --nodes="${RUN_NODES}" --ntasks="${COMPARE_TASKS}" \
-    "${APPTAINER_BIN}" exec --userns --no-privs --bind "${APPTAINER_BIND_PATHS}" "${SIF_IMAGE}" \
+    "${APPTAINER_NODE_EXEC}" \
     bash -lc "${COMMON_ENV} && \
       export OMP_TARGET_OFFLOAD=MANDATORY && \
       export OMPTARGET_DISABLE_HOST_PLUGIN=1 && \
@@ -205,7 +219,7 @@ run_ompfile_target() { # mode extra_env_stmt [file_per_rank] [async] [segmented]
   local data_path="${COMPARE_OUTDIR}/data-${mode}"
   echo "[hacc-io-cmp] ${mode} target-region issuers (1 app + $((COMPARE_TASKS - 1)) proxies, logical_ranks=${COMPARE_TASKS}, data generated device-side)"
   srun --kill-on-bad-exit=1 --mpi=pmi2 --nodes="${RUN_NODES}" --ntasks="${COMPARE_TASKS}" \
-    "${APPTAINER_BIN}" exec --userns --no-privs --bind "${APPTAINER_BIND_PATHS}" "${SIF_IMAGE}" \
+    "${APPTAINER_NODE_EXEC}" \
     bash -lc "${COMMON_ENV} && \
       export OMP_TARGET_OFFLOAD=MANDATORY && \
       export OMPTARGET_DISABLE_HOST_PLUGIN=1 && \
@@ -259,7 +273,7 @@ run_ior_target() { # mode extra_env_stmt [shared] [read_shift]
   local data_path="${COMPARE_OUTDIR}/data-${mode}"
   echo "[hacc-io-cmp] ${mode} target-region IOR pattern (writers=proxies, transfer=${IORT_TRANSFER_BYTES} block=${IORT_BLOCK_BYTES} shared=${shared} read_shift=${read_shift})"
   srun --kill-on-bad-exit=1 --mpi=pmi2 --nodes="${RUN_NODES}" --ntasks="${COMPARE_TASKS}" \
-    "${APPTAINER_BIN}" exec --userns --no-privs --bind "${APPTAINER_BIND_PATHS}" "${SIF_IMAGE}" \
+    "${APPTAINER_NODE_EXEC}" \
     bash -lc "${COMMON_ENV} && \
       export OMP_TARGET_OFFLOAD=MANDATORY && \
       export OMPTARGET_DISABLE_HOST_PLUGIN=1 && \
