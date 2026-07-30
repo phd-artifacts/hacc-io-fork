@@ -342,7 +342,7 @@ export LIBOMPFILE_OPT_LOCAL_DISJOINT_WRITE=1 &&"
 # docs/known-issues.md); scoped to this lane so the campaign two-phase story stays.
 TARGET_LOCAL_NOTWOPHASE_ENV="${TARGET_LOCAL_ENV} export LIBOMPFILE_OPT_TWO_PHASE=disabled &&"
 # Owner-bypass on BOTH directions (see AMD variant).
-TARGET_LOCAL_RW_ENV="${TARGET_LOCAL_ENV} && export LIBOMPFILE_OPT_LOCAL_DISJOINT_READ=1"
+TARGET_LOCAL_RW_ENV="${TARGET_LOCAL_ENV} export LIBOMPFILE_OPT_LOCAL_DISJOINT_READ=1 &&"
 
 MODE_LIST="${COMPARE_MODES_RAW//,/ }"
 for mode in ${MODE_LIST}; do
