@@ -41,4 +41,4 @@ cascade of "Invalid file handle" writes) now report via
 Methodology (matches the IOR backend-compare lane): POSIX/MPIIO baselines
 run N SPMD ranks; the OMPFILE variant runs split-role (1 app rank + N-1 MPP
 proxies) with `HACC_RANKS = N` so aggregate bytes match — the
-split-role-vs-direct-rank caveat from docs/quick-reference.md applies.
+split-role-vs-direct-rank caveat from docs/benchmark-catalog.md applies.
