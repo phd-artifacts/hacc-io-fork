@@ -53,9 +53,14 @@ COMPARE_CLEAN_DATA="${HACC_COMPARE_CLEAN_DATA:-1}"
 # Concurrent-issue lanes: issuer threads over logical ranks (default = one
 # issuer per logical rank, matching the SPMD baselines' concurrency).
 COMPARE_CONCURRENCY="${HACC_COMPARE_CONCURRENCY:-${COMPARE_TASKS}}"
-# srun runs 1 task/node; when the sweep uses fewer tasks than the allocation the
-# node count must follow COMPARE_TASKS or srun rejects the step.
-RUN_NODES="${COMPARE_TASKS}"
+# Full campaigns use one task per node. Reduced preflights may place the same
+# split-role topology (2 proxies + 1 app) on one node, so cap the default by the
+# enclosing allocation and only request one task per node when the counts match.
+RUN_NODES="${HACC_COMPARE_NODES:-${COMPARE_TASKS}}"
+if [[ -z "${HACC_COMPARE_NODES:-}" && -n "${SLURM_JOB_NUM_NODES:-}" ]] &&
+   (( RUN_NODES > SLURM_JOB_NUM_NODES )); then
+  RUN_NODES="${SLURM_JOB_NUM_NODES}"
+fi
 BUILD_HACC="${HACC_BUILD:-1}"
 OMPFILE_SCHEDULER="${HACC_OMPFILE_SCHEDULER:-${LIBOMPFILE_SCHEDULER:-HEADNODE}}"
 RUN_MPI_TYPE="${RUN_MPI_TYPE:-pmix}"
@@ -64,8 +69,12 @@ if [[ ! "${COMPARE_PARTICLES}" =~ ^[0-9]+$ ]] || (( COMPARE_PARTICLES < 1 )); th
   echo "Error: HACC_COMPARE_PARTICLES must be a positive integer, got '${COMPARE_PARTICLES}'." >&2
   exit 1
 fi
-if (( COMPARE_TASKS < 2 )); then
+if [[ ! "${COMPARE_TASKS}" =~ ^[0-9]+$ ]] || (( COMPARE_TASKS < 2 )); then
   echo "Error: HACC compare requires at least 2 tasks." >&2
+  exit 1
+fi
+if [[ ! "${RUN_NODES}" =~ ^[0-9]+$ ]] || (( RUN_NODES < 1 || RUN_NODES > COMPARE_TASKS )); then
+  echo "Error: HACC_COMPARE_NODES must be between 1 and HACC_COMPARE_TASKS (${COMPARE_TASKS}), got '${RUN_NODES}'." >&2
   exit 1
 fi
 if [[ ! -e "${CONTAINER_IMAGE}" ]]; then
@@ -75,6 +84,13 @@ fi
 if [[ ! -x "${PROXY_BIN}" ]]; then
   echo "Error: proxy binary not found: ${PROXY_BIN}" >&2
   exit 1
+fi
+
+SRUN_PLACEMENT=(--nodes="${RUN_NODES}" --ntasks="${COMPARE_TASKS}")
+if (( RUN_NODES == COMPARE_TASKS )); then
+  SRUN_PLACEMENT+=(--ntasks-per-node=1)
+else
+  SRUN_PLACEMENT+=(--distribution=block:block)
 fi
 
 # Host spack MPICH (pmi=pmix, cluster-matched) — required for every rank so
@@ -192,7 +208,7 @@ EOF
     "export HACC_IO_INTERFACE=${ifname}
 export HACC_FSYNC_ON_CLOSE=${HACC_BASELINE_FSYNC:-0}" \
     "run_in_container \"${COMPARE_OUTDIR}/exec-${mode}.sh\""
-  srun --kill-on-bad-exit=1 --mpi="${RUN_MPI_TYPE}" --nodes="${RUN_NODES}" --ntasks="${COMPARE_TASKS}" --ntasks-per-node=1 \
+  srun --kill-on-bad-exit=1 --mpi="${RUN_MPI_TYPE}" "${SRUN_PLACEMENT[@]}" \
     "${role_path}" > "${log_file}" 2>&1 || { echo "Error: baseline ${mode} failed" >&2; tail -n 40 "${log_file}" >&2; exit 1; }
   grep -q 'CONTENTS VERIFIED' "${log_file}" || { echo "Error: baseline ${mode} did not verify" >&2; tail -n 40 "${log_file}" >&2; exit 1; }
   collect_summary "${log_file}" "${mode}"
@@ -235,7 +251,7 @@ ${extra_env}" \
 else
   run_in_container \"${PROXY_BIN}\"
 fi"
-  srun --kill-on-bad-exit=1 --mpi="${RUN_MPI_TYPE}" --nodes="${RUN_NODES}" --ntasks="${COMPARE_TASKS}" --ntasks-per-node=1 \
+  srun --kill-on-bad-exit=1 --mpi="${RUN_MPI_TYPE}" "${SRUN_PLACEMENT[@]}" \
     "${role_path}" > "${log_file}" 2>&1 || { echo "Error: ${mode} failed" >&2; tail -n 60 "${log_file}" >&2; exit 1; }
   grep -q 'CONTENTS VERIFIED' "${log_file}" || { echo "Error: ${mode} did not verify" >&2; tail -n 60 "${log_file}" >&2; exit 1; }
   collect_summary "${log_file}" "${mode}"
@@ -280,7 +296,7 @@ ${extra_env}" \
 else
   run_in_container \"${PROXY_BIN}\"
 fi"
-  srun --kill-on-bad-exit=1 --mpi="${RUN_MPI_TYPE}" --nodes="${RUN_NODES}" --ntasks="${COMPARE_TASKS}" --ntasks-per-node=1 \
+  srun --kill-on-bad-exit=1 --mpi="${RUN_MPI_TYPE}" "${SRUN_PLACEMENT[@]}" \
     "${role_path}" > "${log_file}" 2>&1 || { echo "Error: ${mode} failed" >&2; tail -n 60 "${log_file}" >&2; exit 1; }
   grep -q 'CONTENTS VERIFIED' "${log_file}" || { echo "Error: ${mode} did not verify" >&2; tail -n 60 "${log_file}" >&2; exit 1; }
   collect_summary "${log_file}" "${mode}"
@@ -337,7 +353,7 @@ ${extra_env}" \
 else
   run_in_container \"${PROXY_BIN}\"
 fi"
-  srun --kill-on-bad-exit=1 --mpi="${RUN_MPI_TYPE}" --nodes="${RUN_NODES}" --ntasks="${COMPARE_TASKS}" --ntasks-per-node=1 \
+  srun --kill-on-bad-exit=1 --mpi="${RUN_MPI_TYPE}" "${SRUN_PLACEMENT[@]}" \
     "${role_path}" > "${log_file}" 2>&1 || { echo "Error: ${mode} failed" >&2; tail -n 60 "${log_file}" >&2; exit 1; }
   grep -q 'CONTENTS VERIFIED' "${log_file}" || { echo "Error: ${mode} did not verify" >&2; tail -n 60 "${log_file}" >&2; exit 1; }
   collect_ior_target_summary "${log_file}" "${mode}"
