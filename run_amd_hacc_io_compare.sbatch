@@ -266,6 +266,12 @@ run_ompfile_target() { # mode extra_env_stmt [file_per_rank] [async] [segmented]
   local fpr="${3:-0}"
   local async="${4:-0}"
   local segmented="${5:-0}"
+  # Segment-shape sweep: HACC_SEG_COUNT=N overrides the segment count for the
+  # segmented modes only (N>1 = equal chunks in the driver; 1 = legacy 9-way
+  # GLEAN split). Coalesced/non-seg modes are never affected.
+  if [[ "${segmented}" == "1" && -n "${HACC_SEG_COUNT:-}" ]]; then
+    segmented="${HACC_SEG_COUNT}"
+  fi
   local concurrent="${6:-0}"
   local log_file="${COMPARE_OUTDIR}/${mode}.log"
   local data_path="${COMPARE_OUTDIR}/data-${mode}"

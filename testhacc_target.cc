@@ -137,7 +137,9 @@ static int rank_block_target(int device_id, int handle, int64_t lr,
       // rank block instead of 9 sequential per-op transfers — lifts per-proxy
       // efficiency (each op carries scheduler/transport fixed cost). async lets
       // the runtime pipeline the transfer. segmented=1 falls back to the 9-op
-      // path for comparison. (io_async/segmented read host-side, passed in.)
+      // GLEAN path for comparison; segmented=N (N>1) splits the rank block
+      // into N equal chunks instead, the segment-shape sweep dimension.
+      // (io_async/segmented read host-side, passed in.)
       if (!segmented) {
         const int io_rc =
             writing ? omp_file_pwrite(active_handle, base, buf,
@@ -147,6 +149,26 @@ static int rank_block_target(int device_id, int handle, int64_t lr,
         if (io_rc != 0) {
           rc = writing ? 20 : 21;
           saved_errno = errno;
+        }
+      } else if (segmented > 1) {
+        const int64_t seg_n = segmented;
+        const int64_t chunk = (rank_bytes + seg_n - 1) / seg_n;
+        int64_t off = base;
+        int64_t buf_off = 0;
+        while (buf_off < rank_bytes && rc == 0) {
+          const int64_t this_bytes =
+              (rank_bytes - buf_off < chunk) ? (rank_bytes - buf_off) : chunk;
+          const int io_rc =
+              writing ? omp_file_pwrite(active_handle, off, buf + buf_off,
+                                        (size_t)this_bytes, io_async)
+                      : omp_file_pread(active_handle, off, buf + buf_off,
+                                       (size_t)this_bytes, io_async);
+          if (io_rc != 0) {
+            rc = writing ? 20 : 21;
+            saved_errno = errno;
+          }
+          off += this_bytes;
+          buf_off += this_bytes;
         }
       } else {
         const int64_t seg_bytes[9] = {float_bytes, float_bytes, float_bytes,
