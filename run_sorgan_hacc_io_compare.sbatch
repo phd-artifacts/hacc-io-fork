@@ -332,17 +332,22 @@ export LIBOMPFILE_WRITETHROUGH_FSYNC_POLICY=each &&"
 # target-region lanes default to the close policy (override via env).
 TARGET_WT_ENV="export LIBOMPFILE_STAGE_MODE=off && \
 export LIBOMPFILE_WRITETHROUGH_FSYNC_POLICY=${HACC_TARGET_FSYNC_POLICY:-close} &&"
-# Owner-bypass: shared file, but each proxy writes its disjoint range locally
-# (LIBOMPFILE_OPT_LOCAL_DISJOINT_WRITE=1) instead of forwarding to the file owner.
+# Owner-bypass: shared file, but each proxy reads/writes its disjoint range
+# locally instead of forwarding to the file owner. The read flag is required
+# too: without it restart preads funnel through the owner's single stream
+# (see the AMD variant's comment; AMD segsweep job 372096 showed
+# local_disjoint_reads=0 with reads flat at 1.4-1.7 GiB/s vs 5.6-8.5 writes).
 TARGET_LOCAL_ENV="export LIBOMPFILE_STAGE_MODE=off && \
 export LIBOMPFILE_WRITETHROUGH_FSYNC_POLICY=${HACC_TARGET_FSYNC_POLICY:-close} && \
-export LIBOMPFILE_OPT_LOCAL_DISJOINT_WRITE=1 &&"
+export LIBOMPFILE_OPT_LOCAL_DISJOINT_WRITE=1 && \
+export LIBOMPFILE_OPT_LOCAL_DISJOINT_READ=1 &&"
 # Concurrent-open validation lane bypasses the two-phase batch read planner to
 # dodge an unrelated intermittent MPI_Testany truncation in that path (see
 # docs/known-issues.md); scoped to this lane so the campaign two-phase story stays.
 TARGET_LOCAL_NOTWOPHASE_ENV="${TARGET_LOCAL_ENV} export LIBOMPFILE_OPT_TWO_PHASE=disabled &&"
-# Owner-bypass on BOTH directions (see AMD variant).
-TARGET_LOCAL_RW_ENV="${TARGET_LOCAL_ENV} export LIBOMPFILE_OPT_LOCAL_DISJOINT_READ=1 &&"
+# Owner-bypass on BOTH directions: alias — TARGET_LOCAL_ENV now carries the
+# read bypass itself.
+TARGET_LOCAL_RW_ENV="${TARGET_LOCAL_ENV}"
 
 MODE_LIST="${COMPARE_MODES_RAW//,/ }"
 for mode in ${MODE_LIST}; do

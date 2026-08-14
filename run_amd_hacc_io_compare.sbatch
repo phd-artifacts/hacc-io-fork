@@ -390,21 +390,27 @@ export LIBOMPFILE_WRITETHROUGH_FSYNC_POLICY=each"
 # target-region lanes default to the close policy (override via env).
 TARGET_WT_ENV="export LIBOMPFILE_STAGE_MODE=off
 export LIBOMPFILE_WRITETHROUGH_FSYNC_POLICY=${HACC_TARGET_FSYNC_POLICY:-close}"
-# Owner-bypass: shared file, each proxy writes its disjoint range locally.
+# Owner-bypass: shared file, each proxy reads/writes its disjoint range
+# locally. The read flag matters as much as the write flag: without it every
+# restart pread funnels through the file owner's single stream — flat
+# 1.4-1.7 GiB/s regardless of op shape or async (segsweep job 372096,
+# proxies show local_disjoint_reads=0) while the same lanes write at
+# 5.6-8.5 GiB/s. HACC's read phase re-reads the same lr%devices ranges the
+# proxy wrote, so the disjointness contract holds; writes are flushed at the
+# preceding logical close (fsync policy close).
 TARGET_LOCAL_ENV="export LIBOMPFILE_STAGE_MODE=off
 export LIBOMPFILE_WRITETHROUGH_FSYNC_POLICY=${HACC_TARGET_FSYNC_POLICY:-close}
-export LIBOMPFILE_OPT_LOCAL_DISJOINT_WRITE=1"
+export LIBOMPFILE_OPT_LOCAL_DISJOINT_WRITE=1
+export LIBOMPFILE_OPT_LOCAL_DISJOINT_READ=1"
 # Concurrent-open validation lane bypasses the two-phase batch read planner to
 # dodge an unrelated intermittent MPI_Testany truncation in that path (see
 # docs/known-issues.md). This lane proves the open path; scalar verification
 # reads are fine, and this scoping leaves the campaign's two-phase story intact.
 TARGET_LOCAL_NOTWOPHASE_ENV="${TARGET_LOCAL_ENV}
 export LIBOMPFILE_OPT_TWO_PHASE=disabled"
-# Owner-bypass on BOTH directions: disjoint writes go local, and reads of
-# flushed disjoint ranges are served from a local O_RDONLY fd instead of the
-# owner funnel (LIBOMPFILE_OPT_LOCAL_DISJOINT_READ).
-TARGET_LOCAL_RW_ENV="${TARGET_LOCAL_ENV}
-export LIBOMPFILE_OPT_LOCAL_DISJOINT_READ=1"
+# Owner-bypass on BOTH directions: kept as a named alias for the IOR lanes —
+# TARGET_LOCAL_ENV now carries the read bypass itself.
+TARGET_LOCAL_RW_ENV="${TARGET_LOCAL_ENV}"
 # No-batch bypass: both-direction bypass with the client-side batch windows
 # off. The write-batch and two-phase planners each hold every op in a 2 ms
 # grouping window (kDefault*WindowUs) to merge funnel traffic across ranks —
