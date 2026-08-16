@@ -370,13 +370,25 @@ fi"
 
 # Topology for the write-back lane: node-local stage on proxy hosts,
 # authoritative storage on wekafs (/work1).
+STAGE_ROOT="/tmp/${USER}/libompfile-stage/hacc-${SLURM_JOB_ID}"
 TOPOLOGY_FILE="${COMPARE_OUTDIR}/topology.txt"
 {
   echo "global /work1 parallel_fs"
   scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -n $((COMPARE_TASKS - 1)) | while read -r host; do
-    echo "host ${host} /tmp/${USER}/libompfile-stage/hacc-${SLURM_JOB_ID} local-posix"
+    echo "host ${host} ${STAGE_ROOT} local-posix"
   done
 } > "${TOPOLOGY_FILE}"
+
+# Node-local stage files are as large as each proxy's share of the payload
+# (7.6 GB/rank at pubscale) and nothing reclaims them when the step ends, so
+# repeated staged cells would fill /tmp (a real 147 GB SSD on mi2104x). Drop
+# this job's stage root on every node after each staged cell.
+clean_stage_dirs() {
+  [[ "${COMPARE_CLEAN_DATA}" == "1" ]] || return 0
+  srun --nodes="${RUN_NODES}" --ntasks="${RUN_NODES}" --ntasks-per-node=1 \
+    bash -c "rm -rf '${STAGE_ROOT}'" >/dev/null 2>&1 || \
+    echo "[amd-hacc-io-cmp] warning: stage cleanup failed for ${STAGE_ROOT}" >&2
+}
 
 WB_ENV="export LIBOMPFILE_STAGE_MODE=readthrough
 export LIBOMPFILE_STAGE_ROOT_POLICY=topology
@@ -440,15 +452,15 @@ for mode in ${MODE_LIST}; do
   case "${mode}" in
     posix|mpiio) run_baseline "${mode}" ;;
     ompfile-wt) run_ompfile ompfile-wt "${WT_ENV}" 1 ;;
-    ompfile-wb) run_ompfile ompfile-wb "${WB_ENV}" 1 ;;
+    ompfile-wb) run_ompfile ompfile-wb "${WB_ENV}" 1; clean_stage_dirs ;;
     ompfile-wt-conc) run_ompfile ompfile-wt-conc "${WT_ENV}" "${COMPARE_CONCURRENCY}" ;;
-    ompfile-wb-conc) run_ompfile ompfile-wb-conc "${WB_ENV}" "${COMPARE_CONCURRENCY}" ;;
+    ompfile-wb-conc) run_ompfile ompfile-wb-conc "${WB_ENV}" "${COMPARE_CONCURRENCY}"; clean_stage_dirs ;;
     ompfile-target-wt) run_ompfile_target ompfile-target-wt "${TARGET_WT_ENV}" 0 ;;
     ompfile-target-local) run_ompfile_target ompfile-target-local "${TARGET_LOCAL_ENV}" 0 0 0 ;;
     ompfile-target-local-async) run_ompfile_target ompfile-target-local-async "${TARGET_LOCAL_ENV}" 0 1 0 ;;
     ompfile-target-local-seg) run_ompfile_target ompfile-target-local-seg "${TARGET_LOCAL_ENV}" 0 0 1 ;;
     ompfile-target-local-seg-async) run_ompfile_target ompfile-target-local-seg-async "${TARGET_LOCAL_ENV}" 0 1 1 ;;
-    ompfile-target-wb) run_ompfile_target ompfile-target-wb "${WB_ENV}" 0 ;;
+    ompfile-target-wb) run_ompfile_target ompfile-target-wb "${WB_ENV}" 0; clean_stage_dirs ;;
     ompfile-target-fpr) run_ompfile_target ompfile-target-fpr "${TARGET_WT_ENV}" 1 ;;
     ompfile-target-fpr-concurrent) run_ompfile_target ompfile-target-fpr-concurrent "${TARGET_LOCAL_ENV}" 1 0 0 1 ;;
     ompfile-target-fpr-concurrent-twophase-trace) run_ompfile_target ompfile-target-fpr-concurrent-twophase-trace "${TARGET_LOCAL_TWOPHASE_TRACE_ENV}" 1 0 0 1 ;;
