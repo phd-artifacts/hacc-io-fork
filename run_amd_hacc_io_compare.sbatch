@@ -410,15 +410,34 @@ export LIBOMPFILE_WRITETHROUGH_FSYNC_POLICY=${HACC_TARGET_FSYNC_POLICY:-close}"
 # 5.6-8.5 GiB/s. HACC's read phase re-reads the same lr%devices ranges the
 # proxy wrote, so the disjointness contract holds; writes are flushed at the
 # preceding logical close (fsync policy close).
-TARGET_LOCAL_ENV="export LIBOMPFILE_STAGE_MODE=off
+TARGET_LOCAL_BATCHED_ENV="export LIBOMPFILE_STAGE_MODE=off
 export LIBOMPFILE_WRITETHROUGH_FSYNC_POLICY=${HACC_TARGET_FSYNC_POLICY:-close}
 export LIBOMPFILE_OPT_LOCAL_DISJOINT_WRITE=1
 export LIBOMPFILE_OPT_LOCAL_DISJOINT_READ=1"
+# DEFAULT since Sep 10, 2026: the bypass above plus the client-side window
+# removal. With one writer per proxy the write-batch and two-phase planners
+# merge nothing (write_queue_max_depth=1 in every HACC run measured) yet still
+# hold each op in a 2 ms grouping window. Removing them is worth 1.69x median
+# on wekafs at 50M/4 nodes and 1.20x write / 1.74x read on sorgan NFS, so it is
+# not a fast-storage tweak. TARGET_LOCAL_BATCHED_ENV keeps the pre-Sep-10
+# behaviour for reproducing older rows.
+TARGET_LOCAL_ENV="${TARGET_LOCAL_BATCHED_ENV}
+export LIBOMPFILE_OPT_WRITE_BATCH=disabled
+export LIBOMPFILE_OPT_TWO_PHASE=disabled
+export LIBOMPFILE_OPT_LOCAL_DISJOINT_EXPRESS=1"
+# Single-knob ablations, all derived from the pre-Sep-10 baseline so each
+# isolates one setting.
+TARGET_LOCAL_ABL_BATCH_ENV="${TARGET_LOCAL_BATCHED_ENV}
+export LIBOMPFILE_OPT_WRITE_BATCH=disabled"
+TARGET_LOCAL_ABL_TWOPHASE_ENV="${TARGET_LOCAL_BATCHED_ENV}
+export LIBOMPFILE_OPT_TWO_PHASE=disabled"
+TARGET_LOCAL_ABL_EXPRESS_ENV="${TARGET_LOCAL_BATCHED_ENV}
+export LIBOMPFILE_OPT_LOCAL_DISJOINT_EXPRESS=1"
 # Concurrent-open validation lane bypasses the two-phase batch read planner to
 # dodge an unrelated intermittent MPI_Testany truncation in that path (see
 # docs/known-issues.md). This lane proves the open path; scalar verification
 # reads are fine, and this scoping leaves the campaign's two-phase story intact.
-TARGET_LOCAL_NOTWOPHASE_ENV="${TARGET_LOCAL_ENV}
+TARGET_LOCAL_NOTWOPHASE_ENV="${TARGET_LOCAL_BATCHED_ENV}
 export LIBOMPFILE_OPT_TWO_PHASE=disabled"
 # Owner-bypass on BOTH directions: kept as a named alias for the IOR lanes —
 # TARGET_LOCAL_ENV now carries the read bypass itself.
@@ -443,7 +462,7 @@ export LIBOMPFILE_OPT_LOCAL_DISJOINT_READAHEAD=${HACC_TARGET_COALESCE_BYTES:-167
 # Traced reproducer for the two-phase batch-read MPI_Testany truncation
 # (docs/known-issues.md): two-phase stays ENABLED, proxy + headnode tracing on,
 # so a failing run captures the sender/receiver size disagreement.
-TARGET_LOCAL_TWOPHASE_TRACE_ENV="${TARGET_LOCAL_ENV}
+TARGET_LOCAL_TWOPHASE_TRACE_ENV="${TARGET_LOCAL_BATCHED_ENV}
 export LIBOMPFILE_FRESHNESS_TRACE=1
 export LIBOMPFILE_DEBUG_TRACE=1"
 
@@ -460,6 +479,21 @@ for mode in ${MODE_LIST}; do
     ompfile-target-local-async) run_ompfile_target ompfile-target-local-async "${TARGET_LOCAL_ENV}" 0 1 0 ;;
     ompfile-target-local-seg) run_ompfile_target ompfile-target-local-seg "${TARGET_LOCAL_ENV}" 0 0 1 ;;
     ompfile-target-local-seg-async) run_ompfile_target ompfile-target-local-seg-async "${TARGET_LOCAL_ENV}" 0 1 1 ;;
+    # Same shape with the client-side grouping windows off and the express
+    # path on. The bypass serves ops locally, so nobody ever joins the 2 ms
+    # write-batch/two-phase windows and they are a pure per-op tax
+    # (write_queue_max_depth=1 in every HACC run measured so far). These two
+    # cases carry the env the IOR lanes already use; HACC had never been run
+    # with it.
+    ompfile-target-local-nb-seg-async) run_ompfile_target ompfile-target-local-nb-seg-async "${TARGET_LOCAL_RW_NB_ENV}" 0 1 1 ;;
+    # Coalesced (one pwrite per region instead of the nine GLEAN segments):
+    # isolates per-op dispatch cost from per-byte cost at a fixed proxy count.
+    ompfile-target-local-nb-async) run_ompfile_target ompfile-target-local-nb-async "${TARGET_LOCAL_RW_NB_ENV}" 0 1 0 ;;
+    ompfile-target-local-batched-seg-async) run_ompfile_target ompfile-target-local-batched-seg-async "${TARGET_LOCAL_BATCHED_ENV}" 0 1 1 ;;
+    ompfile-target-local-abl-batch-seg-async) run_ompfile_target ompfile-target-local-abl-batch-seg-async "${TARGET_LOCAL_ABL_BATCH_ENV}" 0 1 1 ;;
+    ompfile-target-local-abl-twophase-seg-async) run_ompfile_target ompfile-target-local-abl-twophase-seg-async "${TARGET_LOCAL_ABL_TWOPHASE_ENV}" 0 1 1 ;;
+    ompfile-target-local-abl-express-seg-async) run_ompfile_target ompfile-target-local-abl-express-seg-async "${TARGET_LOCAL_ABL_EXPRESS_ENV}" 0 1 1 ;;
+    ompfile-target-local-co-seg-async) run_ompfile_target ompfile-target-local-co-seg-async "${TARGET_LOCAL_RW_CO_ENV}" 0 1 1 ;;
     ompfile-target-wb) run_ompfile_target ompfile-target-wb "${WB_ENV}" 0; clean_stage_dirs ;;
     ompfile-target-fpr) run_ompfile_target ompfile-target-fpr "${TARGET_WT_ENV}" 1 ;;
     ompfile-target-fpr-concurrent) run_ompfile_target ompfile-target-fpr-concurrent "${TARGET_LOCAL_ENV}" 1 0 0 1 ;;

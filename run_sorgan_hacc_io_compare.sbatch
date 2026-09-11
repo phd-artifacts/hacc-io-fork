@@ -337,17 +337,38 @@ export LIBOMPFILE_WRITETHROUGH_FSYNC_POLICY=${HACC_TARGET_FSYNC_POLICY:-close} &
 # too: without it restart preads funnel through the owner's single stream
 # (see the AMD variant's comment; AMD segsweep job 372096 showed
 # local_disjoint_reads=0 with reads flat at 1.4-1.7 GiB/s vs 5.6-8.5 writes).
-TARGET_LOCAL_ENV="export LIBOMPFILE_STAGE_MODE=off && \
+TARGET_LOCAL_BATCHED_ENV="export LIBOMPFILE_STAGE_MODE=off && \
 export LIBOMPFILE_WRITETHROUGH_FSYNC_POLICY=${HACC_TARGET_FSYNC_POLICY:-close} && \
 export LIBOMPFILE_OPT_LOCAL_DISJOINT_WRITE=1 && \
 export LIBOMPFILE_OPT_LOCAL_DISJOINT_READ=1 &&"
+# DEFAULT since Sep 10, 2026 — see the AMD lane for the rationale and numbers.
+# Worth 1.20x write / 1.74x read here on NFS (job 429) and 1.69x median write
+# on wekafs, so the window removal is not a fast-storage tweak.
+# TARGET_LOCAL_BATCHED_ENV keeps the pre-Sep-10 behaviour for older rows.
+TARGET_LOCAL_ENV="${TARGET_LOCAL_BATCHED_ENV} \
+export LIBOMPFILE_OPT_WRITE_BATCH=disabled && \
+export LIBOMPFILE_OPT_TWO_PHASE=disabled && \
+export LIBOMPFILE_OPT_LOCAL_DISJOINT_EXPRESS=1 &&"
 # Concurrent-open validation lane bypasses the two-phase batch read planner to
 # dodge an unrelated intermittent MPI_Testany truncation in that path (see
 # docs/known-issues.md); scoped to this lane so the campaign two-phase story stays.
-TARGET_LOCAL_NOTWOPHASE_ENV="${TARGET_LOCAL_ENV} export LIBOMPFILE_OPT_TWO_PHASE=disabled &&"
+TARGET_LOCAL_NOTWOPHASE_ENV="${TARGET_LOCAL_BATCHED_ENV} export LIBOMPFILE_OPT_TWO_PHASE=disabled &&"
 # Owner-bypass on BOTH directions: alias — TARGET_LOCAL_ENV now carries the
 # read bypass itself.
 TARGET_LOCAL_RW_ENV="${TARGET_LOCAL_ENV}"
+# No-batch bypass: the write-batch and two-phase planners each hold every op in
+# a 2 ms grouping window to merge funnel traffic across ranks. With one writer
+# per proxy and the bypass serving ops locally nobody joins the batch
+# (write_queue_max_depth=1), so the window is a pure per-op tax. Mirrors the
+# AMD lane's block of the same name.
+TARGET_LOCAL_RW_NB_ENV="${TARGET_LOCAL_RW_ENV}
+export LIBOMPFILE_OPT_WRITE_BATCH=disabled
+export LIBOMPFILE_OPT_TWO_PHASE=disabled
+export LIBOMPFILE_OPT_LOCAL_DISJOINT_EXPRESS=1"
+# Coalesced bypass: no-batch plus the proxy-side op-coalescing layer.
+TARGET_LOCAL_RW_CO_ENV="${TARGET_LOCAL_RW_NB_ENV}
+export LIBOMPFILE_OPT_LOCAL_DISJOINT_WRITE_COMBINE=${HACC_TARGET_COALESCE_BYTES:-16777216}
+export LIBOMPFILE_OPT_LOCAL_DISJOINT_READAHEAD=${HACC_TARGET_COALESCE_BYTES:-16777216}"
 
 MODE_LIST="${COMPARE_MODES_RAW//,/ }"
 for mode in ${MODE_LIST}; do
@@ -362,6 +383,18 @@ for mode in ${MODE_LIST}; do
     ompfile-target-local-async) run_ompfile_target ompfile-target-local-async "${TARGET_LOCAL_ENV}" 0 1 0 ;;
     ompfile-target-local-seg) run_ompfile_target ompfile-target-local-seg "${TARGET_LOCAL_ENV}" 0 0 1 ;;
     ompfile-target-local-seg-async) run_ompfile_target ompfile-target-local-seg-async "${TARGET_LOCAL_ENV}" 0 1 1 ;;
+    # Same shape with the client-side grouping windows off and the express
+    # path on. The bypass serves ops locally, so nobody ever joins the 2 ms
+    # write-batch/two-phase windows and they are a pure per-op tax
+    # (write_queue_max_depth=1 in every HACC run measured so far). These two
+    # cases carry the env the IOR lanes already use; HACC had never been run
+    # with it.
+    ompfile-target-local-nb-seg-async) run_ompfile_target ompfile-target-local-nb-seg-async "${TARGET_LOCAL_RW_NB_ENV}" 0 1 1 ;;
+    # Coalesced (one pwrite per region instead of the nine GLEAN segments):
+    # isolates per-op dispatch cost from per-byte cost at a fixed proxy count.
+    ompfile-target-local-nb-async) run_ompfile_target ompfile-target-local-nb-async "${TARGET_LOCAL_RW_NB_ENV}" 0 1 0 ;;
+    ompfile-target-local-batched-seg-async) run_ompfile_target ompfile-target-local-batched-seg-async "${TARGET_LOCAL_BATCHED_ENV}" 0 1 1 ;;
+    ompfile-target-local-co-seg-async) run_ompfile_target ompfile-target-local-co-seg-async "${TARGET_LOCAL_RW_CO_ENV}" 0 1 1 ;;
     ompfile-target-wb) run_ompfile_target ompfile-target-wb "${WB_ENV}" 0 ;;
     ompfile-target-fpr) run_ompfile_target ompfile-target-fpr "${TARGET_WT_ENV}" 1 ;;
     ompfile-target-fpr-concurrent) run_ompfile_target ompfile-target-fpr-concurrent "${TARGET_LOCAL_ENV}" 1 0 0 1 ;;

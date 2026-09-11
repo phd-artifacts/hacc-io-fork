@@ -94,15 +94,21 @@ static int wait_for_target_devices(int required) {
 // opens/closes that per-rank file itself (file-per-rank diagnostic mode) and
 // `handle` is ignored. Returns 0 on success; error codes mirror
 // testhacc_ompfile (1x=alloc, 2x=io, 3x=verify, 4x=fpr open/close).
+// Summed device-side buffer fill time across every region of the run. It is
+// inside the timed write phase, so a reader can subtract it to compare against
+// baselines that fill their arrays before their own timer starts.
+static double g_fill_s = 0.0;
+
 static int rank_block_target(int device_id, int handle, int64_t lr,
                              int64_t particles, int64_t base, bool writing,
                              int io_async, int segmented, int *out_errno) {
   int rc = 0;
   int saved_errno = 0;
+  double fill_s = 0.0;
   const int64_t n = particles;
 #pragma omp target firstprivate(handle, lr, n, base, writing, io_async,        \
                                 segmented)                                     \
-    device(device_id) map(tofrom : rc, saved_errno)
+    device(device_id) map(tofrom : rc, saved_errno, fill_s)
   {
     int active_handle = handle;
     const int64_t float_bytes = n * (int64_t)sizeof(float);
@@ -123,6 +129,13 @@ static int rank_block_target(int device_id, int handle, int64_t lr,
       if (writing) {
         // Data is born on the worker: same deterministic pattern as the
         // upstream driver, generated device-side.
+        //
+        // Timed separately because it sits INSIDE the phase the write
+        // throughput is computed from, while the SPMD baselines fill their
+        // arrays before their own timer starts. Reporting it keeps the
+        // comparison auditable instead of silently charging generation to
+        // OMPFILE's write bandwidth.
+        const double fill_t0 = omp_get_wtime();
         for (int64_t i = 0; i < n; ++i) {
           const float f = (float)i;
           for (int a = 0; a < 7; ++a)
@@ -130,6 +143,7 @@ static int rank_block_target(int device_id, int handle, int64_t lr,
           pid[i] = i;
           mask[i] = (uint16_t)lr;
         }
+        fill_s += omp_get_wtime() - fill_t0;
       }
 
       // The nine GLEAN segments (xx..phi, pid, mask) are contiguous in both the
@@ -207,6 +221,8 @@ static int rank_block_target(int device_id, int handle, int64_t lr,
       free(buf);
     }
   }
+#pragma omp atomic
+  g_fill_s += fill_s;
   if (out_errno)
     *out_errno = saved_errno;
   return rc;
@@ -561,10 +577,11 @@ int main() {
       skip_read ? 0.0 : (double)total_bytes / (1024.0 * 1024.0) / read_s;
   printf("HACC_IO_SUMMARY interface=%s logical_ranks=%" PRId64
          " particles_per_rank=%" PRId64 " bytes=%" PRId64
-         " write_s=%.6f write_mib_s=%.3f read_s=%.6f read_mib_s=%.3f "
+         " write_s=%.6f write_mib_s=%.3f fill_s=%.6f read_s=%.6f read_mib_s=%.3f "
          "verified=%d concurrency=%d\n",
          file_per_rank ? "ompfile_target_fpr" : "ompfile_target", ranks,
-         particles, total_bytes, write_s, write_mib, read_s, read_mib, verified,
+         particles, total_bytes, write_s, write_mib, g_fill_s, read_s,
+         read_mib, verified,
          devices);
   printf(" CONTENTS VERIFIED... Success \n"); // match upstream success marker
   if (fpr_paths) {
