@@ -29,11 +29,33 @@
 //                       the issuing device's region. Diagnostic for shared-file
 //                       owner forwarding: per-rank files make the opening proxy
 //                       the owner, so every pwrite executes node-locally.
+//   HACC_PIPELINE       1 = interleave buffer generation with the writes:
+//                       fill particle slice c, issue its nine segment writes,
+//                       fill slice c+1 while the async engine drains c.
+//                       Requires HACC_SEGMENTED != 0 and HACC_PIPELINE_CHUNKS
+//                       > 1, and only overlaps anything with HACC_IO_ASYNC=1.
+//                       Default 0.
+//   HACC_PIPELINE_CHUNKS  particle slices per rank block when pipelining
+//                       (default 4). Each slice issues nine pwrites.
+//   HACC_PIPELINE_FLUSH 0 = let close drain the pipelined writes instead of
+//                       ending each region on omp_file_flush. Default 1;
+//                       0 measured faster (job 414886).
+//   HACC_FILL_ORDER     particle (default) or array. `array` walks one GLEAN
+//                       segment at a time instead of one pass over particles.
+//                       Identical bytes; `array` is 1.63x slower (job 414888)
+//                       and is kept only as that control. Non-pipelined path
+//                       only.
 //
 // Output: one machine-parseable line
 //   HACC_IO_SUMMARY interface=ompfile_target logical_ranks=..
-//     particles_per_rank=.. bytes=.. write_s=.. write_mib_s=.. read_s=..
-//     read_mib_s=.. verified=.. concurrency=<devices>
+//     particles_per_rank=.. bytes=.. write_s=.. write_mib_s=.. fill_s=..
+//     issue_s=.. flush_s=.. region_s=.. read_s=.. read_mib_s=.. verified=..
+//     concurrency=<devices> pipeline=.. pipeline_flush=.. fill_order=..
+//     pipeline_chunks=..
+// fill_s/issue_s/region_s/flush_s are write-phase device-side service time
+// summed over regions (see the g_*_s accumulators); they exceed write_s
+// whenever more than one device is issuing, and they measure the issuing
+// thread only — the storage write itself runs on the async engine's worker.
 
 #include <cerrno>
 #include <cinttypes>
@@ -71,6 +93,17 @@ static int64_t env_i64(const char *name, int64_t defval) {
   return (end && *end == '\0' && parsed > 0) ? (int64_t)parsed : defval;
 }
 
+// env_i64 only accepts strictly positive values, so a knob whose default is 1
+// cannot be turned off through it. Boolean knobs read through this instead.
+static int env_flag(const char *name, int defval) {
+  const char *v = getenv(name);
+  if (!v || !*v)
+    return defval;
+  char *end = nullptr;
+  long long parsed = strtoll(v, &end, 10);
+  return (end && *end == '\0') ? (int)(parsed != 0) : defval;
+}
+
 static int wait_for_target_devices(int required) {
   const int retries = (int)env_i64("OMPFILE_DEVICE_DISCOVERY_RETRIES", 50);
   const int sleep_ms = (int)env_i64("OMPFILE_DEVICE_DISCOVERY_SLEEP_MS", 100);
@@ -88,28 +121,137 @@ static int wait_for_target_devices(int required) {
   return devices;
 }
 
+// ---- device-side buffer fill ---------------------------------------------
+// The rank block is nine contiguous GLEAN segments: seven float arrays, then
+// the int64 pid array, then the uint16 mask array. `fill_byte_range`
+// regenerates exactly the bytes of [lo, hi), which is what lets the pipelined
+// path produce one chunk at a time. It works at element granularity, so a
+// chunk boundary that falls inside an element is filled by both neighbours —
+// harmless, because the pattern is a pure function of the element index and
+// the async engine has already copied any chunk it was handed.
+//
+// Note this walks the buffer array-major where the pre-pipelining fill walked
+// it particle-major (nine interleaved streams). Both paths now share this one
+// implementation so that an A/B of pipelining holds the fill code constant;
+// `fill_s` is therefore not comparable with rows measured before the change.
+#pragma omp declare target
+// Elements of the segment at `seg_lo` (`n` elements of `elem` bytes each) that
+// intersect the byte range [lo, hi). Returns 0 when the segment is disjoint.
+static int fill_seg_range(int64_t seg_lo, int64_t elem, int64_t n, int64_t lo,
+                          int64_t hi, int64_t *i0, int64_t *i1) {
+  const int64_t seg_bytes = n * elem;
+  int64_t l = lo - seg_lo;
+  int64_t h = hi - seg_lo;
+  if (h <= 0 || l >= seg_bytes)
+    return 0;
+  if (l < 0)
+    l = 0;
+  if (h > seg_bytes)
+    h = seg_bytes;
+  *i0 = l / elem;
+  *i1 = (h + elem - 1) / elem;
+  return 1;
+}
+
+static void fill_byte_range(unsigned char *buf, int64_t n, int64_t lr,
+                            int64_t lo, int64_t hi) {
+  const int64_t float_bytes = n * (int64_t)sizeof(float);
+  const int64_t pid_bytes = n * (int64_t)sizeof(int64_t);
+  int64_t i0 = 0;
+  int64_t i1 = 0;
+  for (int a = 0; a < 7; ++a) {
+    const int64_t seg_lo = (int64_t)a * float_bytes;
+    if (!fill_seg_range(seg_lo, (int64_t)sizeof(float), n, lo, hi, &i0, &i1))
+      continue;
+    float *arr = (float *)(buf + seg_lo);
+    for (int64_t i = i0; i < i1; ++i)
+      arr[i] = (float)i;
+  }
+  if (fill_seg_range(7 * float_bytes, (int64_t)sizeof(int64_t), n, lo, hi, &i0,
+                     &i1)) {
+    int64_t *pid = (int64_t *)(buf + 7 * float_bytes);
+    for (int64_t i = i0; i < i1; ++i)
+      pid[i] = i;
+  }
+  if (fill_seg_range(7 * float_bytes + pid_bytes, (int64_t)sizeof(uint16_t), n,
+                     lo, hi, &i0, &i1)) {
+    uint16_t *mask = (uint16_t *)(buf + 7 * float_bytes + pid_bytes);
+    for (int64_t i = i0; i < i1; ++i)
+      mask[i] = (uint16_t)lr;
+  }
+}
+
+// The original traversal, and the one the pipeline uses: one pass over
+// particles [p0, p1) touching all nine segments per iteration. This is the
+// fast one, by a wide margin — it converts (float)i once per particle where
+// fill_byte_range converts it once per particle *per float array*, seven
+// times as often. Measured 0.198 s vs 0.323 s per 1.9 GB rank block on AMD
+// (job 414888, 3 reps), i.e. 1.63x, worth 1.23x of the whole write phase.
+// That is why pipelined chunks are particle ranges rather than byte ranges.
+static void fill_particle_range(unsigned char *buf, int64_t n, int64_t lr,
+                                int64_t p0, int64_t p1) {
+  const int64_t float_bytes = n * (int64_t)sizeof(float);
+  const int64_t pid_bytes = n * (int64_t)sizeof(int64_t);
+  float *farr[7];
+  for (int a = 0; a < 7; ++a)
+    farr[a] = (float *)(buf + (int64_t)a * float_bytes);
+  int64_t *pid = (int64_t *)(buf + 7 * float_bytes);
+  uint16_t *mask = (uint16_t *)(buf + 7 * float_bytes + pid_bytes);
+  for (int64_t i = p0; i < p1; ++i) {
+    const float f = (float)i;
+    for (int a = 0; a < 7; ++a)
+      farr[a][i] = f;
+    pid[i] = i;
+    mask[i] = (uint16_t)lr;
+  }
+}
+#pragma omp end declare target
+
+// Device-side service-time accumulators, summed over every region of the run.
+// They sit inside the timed write phase, so a reader can subtract them to
+// compare against baselines that fill their arrays before their own timer
+// starts. Regions on different devices run concurrently, so these are sums of
+// per-region service time, not wall clock.
+//   g_fill_s    buffer generation
+//   g_issue_s   time inside omp_file_pwrite/pread — with async that is the
+//               payload copy and enqueue, not the storage write
+//   g_flush_s   time inside the pipelined path's omp_file_flush, which is
+//               where a drain that did not overlap a fill shows up
+//   g_region_s  the whole region body
+//
+// These are consecutive intervals on the issuing thread, so they always sum to
+// about region_s. The storage write is not among them — it runs on the async
+// engine's worker thread. Pipelining therefore shows up as *issue_s falling*
+// (fewer enqueues blocking on a full queue) together with a small flush_s, not
+// as region_s dropping below their sum.
+static double g_fill_s = 0.0;
+static double g_issue_s = 0.0;
+static double g_flush_s = 0.0;
+static double g_region_s = 0.0;
+
 // One logical rank's block, executed entirely on `device_id`: allocate the
 // rank buffer proxy-side, fill (write) or pread+verify (read), and issue the
-// nine segment I/Os at the GLEAN offsets. If `fpr_path` is non-null the region
-// opens/closes that per-rank file itself (file-per-rank diagnostic mode) and
-// `handle` is ignored. Returns 0 on success; error codes mirror
+// segment I/Os at the GLEAN offsets. Returns 0 on success; error codes mirror
 // testhacc_ompfile (1x=alloc, 2x=io, 3x=verify, 4x=fpr open/close).
-// Summed device-side buffer fill time across every region of the run. It is
-// inside the timed write phase, so a reader can subtract it to compare against
-// baselines that fill their arrays before their own timer starts.
-static double g_fill_s = 0.0;
-
 static int rank_block_target(int device_id, int handle, int64_t lr,
                              int64_t particles, int64_t base, bool writing,
-                             int io_async, int segmented, int *out_errno) {
+                             int io_async, int segmented, int pipeline,
+                             int pipeline_flush, int pipeline_chunks,
+                             int particle_major_fill, int *out_errno) {
   int rc = 0;
   int saved_errno = 0;
   double fill_s = 0.0;
+  double issue_s = 0.0;
+  double flush_s = 0.0;
+  double region_s = 0.0;
   const int64_t n = particles;
 #pragma omp target firstprivate(handle, lr, n, base, writing, io_async,        \
-                                segmented)                                     \
-    device(device_id) map(tofrom : rc, saved_errno, fill_s)
+                                segmented, pipeline, pipeline_flush,           \
+                                pipeline_chunks, particle_major_fill)          \
+    device(device_id) map(tofrom : rc, saved_errno, fill_s, issue_s, flush_s,  \
+                          region_s)
   {
+    const double region_t0 = omp_get_wtime();
     int active_handle = handle;
     const int64_t float_bytes = n * (int64_t)sizeof(float);
     const int64_t pid_bytes = n * (int64_t)sizeof(int64_t);
@@ -120,109 +262,175 @@ static int rank_block_target(int device_id, int handle, int64_t lr,
       rc = 10;
       saved_errno = ENOMEM;
     } else {
-      float *farr[7];
-      for (int a = 0; a < 7; ++a)
-        farr[a] = (float *)(buf + (int64_t)a * float_bytes);
-      int64_t *pid = (int64_t *)(buf + 7 * float_bytes);
-      uint16_t *mask = (uint16_t *)(buf + 7 * float_bytes + pid_bytes);
+      // Pipelining needs more than one chunk to interleave, and only actually
+      // overlaps anything when the writes are async — with io_async=0 each
+      // pwrite runs to completion before the next fill.
+      const bool pipelined =
+          writing && pipeline != 0 && pipeline_chunks > 1 && segmented != 0;
 
-      if (writing) {
-        // Data is born on the worker: same deterministic pattern as the
-        // upstream driver, generated device-side.
-        //
-        // Timed separately because it sits INSIDE the phase the write
-        // throughput is computed from, while the SPMD baselines fill their
-        // arrays before their own timer starts. Reporting it keeps the
-        // comparison auditable instead of silently charging generation to
-        // OMPFILE's write bandwidth.
-        const double fill_t0 = omp_get_wtime();
-        for (int64_t i = 0; i < n; ++i) {
-          const float f = (float)i;
-          for (int a = 0; a < 7; ++a)
-            farr[a][i] = f;
-          pid[i] = i;
-          mask[i] = (uint16_t)lr;
-        }
-        fill_s += omp_get_wtime() - fill_t0;
-      }
-
-      // The nine GLEAN segments (xx..phi, pid, mask) are contiguous in both the
-      // buffer and the file, so coalesce them into ONE pwrite/pread of the whole
-      // rank block instead of 9 sequential per-op transfers — lifts per-proxy
-      // efficiency (each op carries scheduler/transport fixed cost). async lets
-      // the runtime pipeline the transfer. segmented=1 falls back to the 9-op
-      // GLEAN path for comparison; segmented=N (N>1) splits the rank block
-      // into N equal chunks instead, the segment-shape sweep dimension.
-      // (io_async/segmented read host-side, passed in.)
-      if (!segmented) {
-        const int io_rc =
-            writing ? omp_file_pwrite(active_handle, base, buf,
-                                      (size_t)rank_bytes, io_async)
-                    : omp_file_pread(active_handle, base, buf,
-                                     (size_t)rank_bytes, io_async);
-        if (io_rc != 0) {
-          rc = writing ? 20 : 21;
-          saved_errno = errno;
-        }
-      } else if (segmented > 1) {
-        const int64_t seg_n = segmented;
-        const int64_t chunk = (rank_bytes + seg_n - 1) / seg_n;
-        int64_t off = base;
-        int64_t buf_off = 0;
-        while (buf_off < rank_bytes && rc == 0) {
-          const int64_t this_bytes =
-              (rank_bytes - buf_off < chunk) ? (rank_bytes - buf_off) : chunk;
-          const int io_rc =
-              writing ? omp_file_pwrite(active_handle, off, buf + buf_off,
-                                        (size_t)this_bytes, io_async)
-                      : omp_file_pread(active_handle, off, buf + buf_off,
-                                       (size_t)this_bytes, io_async);
-          if (io_rc != 0) {
-            rc = writing ? 20 : 21;
-            saved_errno = errno;
-          }
-          off += this_bytes;
-          buf_off += this_bytes;
-        }
-      } else {
-        const int64_t seg_bytes[9] = {float_bytes, float_bytes, float_bytes,
-                                      float_bytes, float_bytes, float_bytes,
-                                      float_bytes, pid_bytes,   mask_bytes};
-        int64_t off = base;
-        int64_t buf_off = 0;
-        for (int s = 0; s < 9 && rc == 0; ++s) {
-          const int io_rc =
-              writing ? omp_file_pwrite(active_handle, off, buf + buf_off,
-                                        (size_t)seg_bytes[s], io_async)
-                      : omp_file_pread(active_handle, off, buf + buf_off,
-                                       (size_t)seg_bytes[s], io_async);
-          if (io_rc != 0) {
-            rc = writing ? 20 : 21;
-            saved_errno = errno;
-          }
-          off += seg_bytes[s];
-          buf_off += seg_bytes[s];
+      // The nine GLEAN segments in buffer/file order: seven float arrays, the
+      // int64 pid array, the uint16 mask array. Contiguous in both, which is
+      // what lets the non-pipelined path coalesce them.
+      const int64_t seg_elem[9] = {
+          (int64_t)sizeof(float),   (int64_t)sizeof(float),
+          (int64_t)sizeof(float),   (int64_t)sizeof(float),
+          (int64_t)sizeof(float),   (int64_t)sizeof(float),
+          (int64_t)sizeof(float),   (int64_t)sizeof(int64_t),
+          (int64_t)sizeof(uint16_t)};
+      int64_t seg_lo[9];
+      {
+        int64_t off = 0;
+        for (int sg = 0; sg < 9; ++sg) {
+          seg_lo[sg] = off;
+          off += n * seg_elem[sg];
         }
       }
 
-      if (!writing && rc == 0) {
-        for (int64_t i = 0; i < n && rc == 0; ++i) {
-          const float f = (float)i;
-          for (int a = 0; a < 7; ++a) {
-            if (farr[a][i] != f) {
-              rc = 30;
-              break;
+      if (pipelined) {
+        // Chunk by PARTICLE range, not by byte range. A byte-range chunk would
+        // force the fill to walk one segment at a time, and that traversal is
+        // 1.63x slower (see fill_particle_range) — enough to swallow the whole
+        // point of the pipeline. So each chunk fills a particle slice with the
+        // original traversal and then issues that slice's nine segment writes,
+        // handing them to the async engine before generating the next slice.
+        // The engine copies the payload on enqueue, which is what makes
+        // refilling the buffer behind it safe, and its bounded queue depth
+        // (LIBOMPFILE_ASYNC_QUEUE_DEPTH, 2 by default) is the throttle.
+        for (int64_t c = 0; c < pipeline_chunks && rc == 0; ++c) {
+          const int64_t p0 = c * n / pipeline_chunks;
+          const int64_t p1 = (c + 1) * n / pipeline_chunks;
+          if (p1 <= p0)
+            continue;
+          const double fill_t0 = omp_get_wtime();
+          fill_particle_range(buf, n, lr, p0, p1);
+          fill_s += omp_get_wtime() - fill_t0;
+          const double io_t0 = omp_get_wtime();
+          for (int sg = 0; sg < 9 && rc == 0; ++sg) {
+            const int64_t buf_off = seg_lo[sg] + p0 * seg_elem[sg];
+            const int64_t bytes = (p1 - p0) * seg_elem[sg];
+            const int io_rc = omp_file_pwrite(active_handle, base + buf_off,
+                                              buf + buf_off, (size_t)bytes,
+                                              io_async);
+            if (io_rc != 0) {
+              rc = 20;
+              saved_errno = errno;
             }
           }
-          if (rc == 0 && (pid[i] != i || mask[i] != (uint16_t)lr))
-            rc = 30;
+          issue_s += omp_get_wtime() - io_t0;
         }
+#ifdef OMPFILE_HAVE_FILE_FLUSH
+        if (pipeline_flush && rc == 0) {
+          // Region-scoped completion boundary for the writes this region
+          // queued. Not needed for buffer safety (the engine copied them) nor
+          // to catch failures (close reports them too); it bounds the pipeline
+          // to one region so one wave's drain cannot spill into the next
+          // wave's fill. Measured to cost ~0.09 s per rank block at 50M
+          // particles (job 414886), so HACC_PIPELINE_FLUSH=0 is the faster
+          // posture and the one the -noflush lane uses.
+          const double flush_t0 = omp_get_wtime();
+          const int flush_rc = omp_file_flush(active_handle);
+          flush_s += omp_get_wtime() - flush_t0;
+          if (flush_rc != 0) {
+            rc = 22;
+            saved_errno = 0; // flush reports the write's rc, never errno
+          }
+        }
+#endif
+      } else {
+        // ---- fill-then-write (the shape this benchmark has always had) -----
+        // One chunk list drives the I/O: segmented=0 coalesces the whole rank
+        // block into ONE op (each op carries scheduler/transport fixed cost),
+        // segmented=1 is the 9-op GLEAN path, segmented=N (N>1) splits the
+        // block into N equal chunks — the segment-shape sweep dimension.
+        int64_t nchunks = !segmented ? 1 : (segmented == 1 ? 9 : segmented);
+        int64_t *chunk_off =
+            (int64_t *)malloc((size_t)nchunks * sizeof(int64_t));
+        int64_t *chunk_len =
+            (int64_t *)malloc((size_t)nchunks * sizeof(int64_t));
+        if (!chunk_off || !chunk_len) {
+          rc = 11;
+          saved_errno = ENOMEM;
+        } else {
+          if (segmented == 1) {
+            for (int sg = 0; sg < 9; ++sg) {
+              chunk_off[sg] = seg_lo[sg];
+              chunk_len[sg] = n * seg_elem[sg];
+            }
+          } else {
+            const int64_t chunk = (rank_bytes + nchunks - 1) / nchunks;
+            int64_t off = 0;
+            int64_t emitted = 0;
+            for (int64_t c = 0; c < nchunks && off < rank_bytes; ++c) {
+              chunk_off[c] = off;
+              chunk_len[c] =
+                  (rank_bytes - off < chunk) ? (rank_bytes - off) : chunk;
+              off += chunk_len[c];
+              ++emitted;
+            }
+            nchunks = emitted;
+          }
+
+          if (writing) {
+            // Data is born on the worker: same deterministic pattern as the
+            // upstream driver, generated device-side, whole block up front.
+            const double fill_t0 = omp_get_wtime();
+            if (particle_major_fill)
+              fill_particle_range(buf, n, lr, 0, n);
+            else
+              fill_byte_range(buf, n, lr, 0, rank_bytes);
+            fill_s += omp_get_wtime() - fill_t0;
+          }
+
+          for (int64_t c = 0; c < nchunks && rc == 0; ++c) {
+            const double io_t0 = omp_get_wtime();
+            const int io_rc =
+                writing ? omp_file_pwrite(active_handle, base + chunk_off[c],
+                                          buf + chunk_off[c],
+                                          (size_t)chunk_len[c], io_async)
+                        : omp_file_pread(active_handle, base + chunk_off[c],
+                                         buf + chunk_off[c],
+                                         (size_t)chunk_len[c], io_async);
+            issue_s += omp_get_wtime() - io_t0;
+            if (io_rc != 0) {
+              rc = writing ? 20 : 21;
+              saved_errno = errno;
+            }
+          }
+        }
+        free(chunk_off);
+        free(chunk_len);
       }
+
+        if (!writing && rc == 0) {
+          float *farr[7];
+          for (int a = 0; a < 7; ++a)
+            farr[a] = (float *)(buf + (int64_t)a * float_bytes);
+          int64_t *pid = (int64_t *)(buf + 7 * float_bytes);
+          uint16_t *mask = (uint16_t *)(buf + 7 * float_bytes + pid_bytes);
+          for (int64_t i = 0; i < n && rc == 0; ++i) {
+            const float f = (float)i;
+            for (int a = 0; a < 7; ++a) {
+              if (farr[a][i] != f) {
+                rc = 30;
+                break;
+              }
+            }
+            if (rc == 0 && (pid[i] != i || mask[i] != (uint16_t)lr))
+              rc = 30;
+          }
+        }
       free(buf);
     }
+    region_s = omp_get_wtime() - region_t0;
   }
 #pragma omp atomic
   g_fill_s += fill_s;
+#pragma omp atomic
+  g_issue_s += issue_s;
+#pragma omp atomic
+  g_flush_s += flush_s;
+#pragma omp atomic
+  g_region_s += region_s;
   if (out_errno)
     *out_errno = saved_errno;
   return rc;
@@ -391,7 +599,9 @@ static int open_rank_handles_concurrent(char **paths, int64_t ranks, int devices
 // only issues reads/writes.
 static int run_phase(const int *handles, int devices, int64_t ranks,
                      int64_t particles, int64_t rank_bytes, bool writing,
-                     bool per_rank, int io_async, int segmented) {
+                     bool per_rank, int io_async, int segmented, int pipeline,
+                     int pipeline_flush, int pipeline_chunks,
+                     int particle_major_fill) {
   int failed = 0;
 #pragma omp parallel num_threads(devices) shared(failed)
   {
@@ -411,7 +621,8 @@ static int run_phase(const int *handles, int devices, int64_t ranks,
             const int handle = per_rank ? handles[lr] : handles[device_id];
             const int rc = rank_block_target(
                 device_id, handle, lr, particles, base, writing, io_async,
-                segmented, &io_errno);
+                segmented, pipeline, pipeline_flush, pipeline_chunks,
+                particle_major_fill, &io_errno);
             if (rc != 0) {
               fprintf(stderr,
                       "FAIL hacc-target %s lr=%" PRId64
@@ -458,12 +669,43 @@ int main() {
   const int segmented = (int)env_i64("HACC_SEGMENTED", 0);
   // Concurrent fresh-open validation knob: HACC_CONCURRENT_OPEN=1 opens the
   // file-per-rank handles as a concurrent wave (the pattern that used to
-  // deadlock) instead of the sequential pre-open workaround. Default 0.
-  // Default flipped to 1 (Jul 30, 2026): the concurrent fresh-open deadlock
-  // was root-fixed (ENOENT backoff off the single data-event handler) and the
-  // path is guarded by the standing hacc-io-concurrent-open lane; concurrent
-  // opens are the realistic checkpoint pattern. Set 0 to serialize opens.
-  const int concurrent_open = (int)env_i64("HACC_CONCURRENT_OPEN", 1);
+  // deadlock) instead of the sequential pre-open workaround; 0 serializes the
+  // opens. Default flipped to 1 (Jul 30, 2026): the concurrent fresh-open
+  // deadlock was root-fixed (ENOENT backoff off the single data-event handler)
+  // and the path is guarded by the standing hacc-io-concurrent-open lane;
+  // concurrent opens are the realistic checkpoint pattern.
+  //
+  // Read as a flag rather than through env_i64, which rejects 0 and so made
+  // the documented "set 0 to serialize" silently keep the concurrent path —
+  // the ompfile-target-fpr lane passed 0 and ran concurrently anyway.
+  const int concurrent_open = env_flag("HACC_CONCURRENT_OPEN", 1);
+  // Fill traversal order for the NON-pipelined path. `particle` (default) is
+  // one pass over particles touching all nine segments; `array` walks one
+  // segment at a time. Identical bytes, and `array` measured 1.63x slower
+  // (job 414888) because it converts (float)i seven times per particle instead
+  // of once — which is why the pipeline chunks by particle range. `array` is
+  // kept as the control that established that, reachable as the
+  // `ompfile-target-local-seg-async-amfill` lane.
+  const char *fill_order = getenv("HACC_FILL_ORDER");
+  const int particle_major_fill =
+      (fill_order && strcmp(fill_order, "array") == 0) ? 0 : 1;
+  // #3 idle time: interleave buffer generation with the writes so the proxy
+  // produces particle slice c+1 while the async engine drains slice c, instead
+  // of filling the whole rank block and only then issuing. Needs a segmented
+  // shape and HACC_IO_ASYNC=1 for the drain to be concurrent.
+  const int pipeline = env_flag("HACC_PIPELINE", 0);
+  // How many particle slices the pipelined path generates and issues per rank
+  // block. Each slice costs nine pwrites (one per GLEAN segment), so this
+  // trades per-op count against how early the first write reaches the engine.
+  const int pipeline_chunks = (int)env_i64("HACC_PIPELINE_CHUNKS", 4);
+  int pipeline_flush = env_flag("HACC_PIPELINE_FLUSH", 1);
+#ifndef OMPFILE_HAVE_FILE_FLUSH
+  if (pipeline && pipeline_flush) {
+    fprintf(stderr, "WARN hacc-target: libompfile has no omp_file_flush; "
+                    "pipelined writes drain at close instead\n");
+    pipeline_flush = 0;
+  }
+#endif
   const int64_t rank_bytes = particles * kRecordBytes;
   const int64_t total_bytes = ranks * rank_bytes;
   const int64_t file_bytes = kHeaderBytes + total_bytes;
@@ -545,12 +787,19 @@ int main() {
     return 1;
   if (run_phase(handles, devices, ranks, particles, rank_bytes,
                 /*writing=*/true, /*per_rank=*/file_per_rank != 0, io_async,
-                segmented) != 0)
+                segmented, pipeline, pipeline_flush, pipeline_chunks,
+                particle_major_fill) != 0)
     return 1;
   if (file_per_rank ? close_rank_handles(ranks, devices, handles)
                     : close_device_handles(devices, handles))
     return 1;
   const double write_s = now_s() - w0;
+  // Snapshot before the read phase adds its own preads to the accumulators:
+  // every *_s field on the summary line describes the write phase.
+  const double w_fill_s = g_fill_s;
+  const double w_issue_s = g_issue_s;
+  const double w_flush_s = g_flush_s;
+  const double w_region_s = g_region_s;
 
   // ----- restart (read + verify) phase -------------------------------------
   double read_s = 0.0;
@@ -562,7 +811,8 @@ int main() {
       return 1;
     if (run_phase(handles, devices, ranks, particles, rank_bytes,
                   /*writing=*/false, /*per_rank=*/file_per_rank != 0, io_async,
-                  segmented) != 0)
+                  segmented, pipeline, pipeline_flush, pipeline_chunks,
+                  particle_major_fill) != 0)
       verified = 0;
     if (file_per_rank ? close_rank_handles(ranks, devices, handles)
                       : close_device_handles(devices, handles))
@@ -577,12 +827,15 @@ int main() {
       skip_read ? 0.0 : (double)total_bytes / (1024.0 * 1024.0) / read_s;
   printf("HACC_IO_SUMMARY interface=%s logical_ranks=%" PRId64
          " particles_per_rank=%" PRId64 " bytes=%" PRId64
-         " write_s=%.6f write_mib_s=%.3f fill_s=%.6f read_s=%.6f read_mib_s=%.3f "
-         "verified=%d concurrency=%d\n",
+         " write_s=%.6f write_mib_s=%.3f fill_s=%.6f issue_s=%.6f "
+         "flush_s=%.6f region_s=%.6f read_s=%.6f read_mib_s=%.3f "
+         "verified=%d concurrency=%d pipeline=%d pipeline_flush=%d "
+         "fill_order=%s pipeline_chunks=%d\n",
          file_per_rank ? "ompfile_target_fpr" : "ompfile_target", ranks,
-         particles, total_bytes, write_s, write_mib, g_fill_s, read_s,
-         read_mib, verified,
-         devices);
+         particles, total_bytes, write_s, write_mib, w_fill_s, w_issue_s,
+         w_flush_s, w_region_s, read_s, read_mib, verified, devices, pipeline,
+         pipeline_flush, particle_major_fill ? "particle" : "array",
+         pipeline_chunks);
   printf(" CONTENTS VERIFIED... Success \n"); // match upstream success marker
   if (fpr_paths) {
     for (int64_t lr = 0; lr < ranks; ++lr)

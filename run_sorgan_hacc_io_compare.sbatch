@@ -127,7 +127,9 @@ exec "${APPTAINER_BIN}" exec --userns --no-privs --bind "\${binds}" "${SIF_IMAGE
 NODE_EXEC
 chmod +x "${APPTAINER_NODE_EXEC}"
 SUMMARY_CSV="${COMPARE_OUTDIR}/hacc-io-summary.csv"
-echo "mode,interface,logical_ranks,particles_per_rank,bytes,write_s,write_mib_s,read_s,read_mib_s,verified" > "${SUMMARY_CSV}"
+# Columns 1-10 are positional for the SPINNER_HACC_IO awk below; the
+# write-phase device-side breakdown is appended after them so that stays true.
+echo "mode,interface,logical_ranks,particles_per_rank,bytes,write_s,write_mib_s,read_s,read_mib_s,verified,fill_s,issue_s,flush_s,region_s,pipeline,fill_order,pipeline_chunks" > "${SUMMARY_CSV}"
 IOR_TARGET_CSV="${COMPARE_OUTDIR}/ior-target-summary.csv"
 echo "mode,writers,devices,transfer_bytes,block_bytes,total_bytes,shared,read_shift,write_open_s,write_s,write_close_s,write_mib_s,read_open_s,read_s,read_close_s,read_mib_s,verified" > "${IOR_TARGET_CSV}"
 # ior-target geometry (IOR -F equivalents; block matches the sorgan IOR lane)
@@ -147,7 +149,7 @@ collect_summary() { # log_file mode
   fi
   local get
   get() { echo "${line}" | grep -oE "$1=[^ ]+" | head -1 | cut -d= -f2; }
-  echo "$2,$(get interface),$(get logical_ranks),$(get particles_per_rank),$(get bytes),$(get write_s),$(get write_mib_s),$(get read_s),$(get read_mib_s),$(get verified)" >> "${SUMMARY_CSV}"
+  echo "$2,$(get interface),$(get logical_ranks),$(get particles_per_rank),$(get bytes),$(get write_s),$(get write_mib_s),$(get read_s),$(get read_mib_s),$(get verified),$(get fill_s),$(get issue_s),$(get flush_s),$(get region_s),$(get pipeline),$(get fill_order),$(get pipeline_chunks)" >> "${SUMMARY_CSV}"
 }
 
 run_baseline() { # mode (posix|mpiio)
@@ -208,13 +210,30 @@ run_ompfile() { # mode (ompfile-wt|ompfile-wb[-conc]) extra_env_stmt [concurrenc
   fi
 }
 
-run_ompfile_target() { # mode extra_env_stmt [file_per_rank] [async] [segmented]
+run_ompfile_target() { # mode extra_env [fpr] [async] [segmented] [concurrent] [pipeline] [pipeline_flush] [fill_order]
   local mode="$1"
   local extra_env="$2"
   local fpr="${3:-0}"
   local async="${4:-0}"
   local segmented="${5:-0}"
+  # Segment-shape sweep, matching the AMD wrapper: HACC_SEG_COUNT=N overrides
+  # the segment count for the segmented modes only (N>1 = equal chunks in the
+  # driver; 1 = legacy 9-way GLEAN split).
+  if [[ "${segmented}" == "1" && -n "${HACC_SEG_COUNT:-}" ]]; then
+    segmented="${HACC_SEG_COUNT}"
+  fi
   local concurrent="${6:-0}"
+  # Fill/write pipelining: the region generates chunk c and hands it to the
+  # async engine before generating chunk c+1, instead of filling the whole rank
+  # block first. Only meaningful with async=1 and a segmented shape.
+  local pipeline="${7:-0}"
+  # Per-mode so a flush and a no-flush pipelined arm can share one job; the
+  # env var stays the global override for modes that do not pass an argument.
+  local pipeline_flush="${8:-${HACC_PIPELINE_FLUSH:-1}}"
+  # particle (default) or array: the buffer-fill traversal order for the
+  # non-pipelined path. `array` is 1.63x slower (job 414888) and exists only as
+  # the control that measured that; the pipeline always fills particle-major.
+  local fill_order="${9:-${HACC_FILL_ORDER:-particle}}"
   local log_file="${COMPARE_OUTDIR}/${mode}.log"
   local data_path="${COMPARE_OUTDIR}/data-${mode}"
   echo "[hacc-io-cmp] ${mode} target-region issuers (1 app + $((COMPARE_TASKS - 1)) proxies, logical_ranks=${COMPARE_TASKS}, data generated device-side)"
@@ -237,7 +256,7 @@ run_ompfile_target() { # mode extra_env_stmt [file_per_rank] [async] [segmented]
       host_name=\$(hostname -s); \
       if [ \"\${SLURM_PROCID}\" -eq $((COMPARE_TASKS - 1)) ]; then \
         echo \"[hacc-io-cmp][rank-map] rank=\${SLURM_PROCID} role=app host=\${host_name}\"; \
-        export HACC_FILE=${data_path} HACC_RANKS=${COMPARE_TASKS} HACC_PARTICLES=${COMPARE_PARTICLES} HACC_FILE_PER_RANK=${fpr} HACC_IO_ASYNC=${async} HACC_SEGMENTED=${segmented} HACC_CONCURRENT_OPEN=${concurrent}; \
+        export HACC_FILE=${data_path} HACC_RANKS=${COMPARE_TASKS} HACC_PARTICLES=${COMPARE_PARTICLES} HACC_FILE_PER_RANK=${fpr} HACC_IO_ASYNC=${async} HACC_SEGMENTED=${segmented} HACC_CONCURRENT_OPEN=${concurrent} HACC_PIPELINE=${pipeline} HACC_PIPELINE_FLUSH=${pipeline_flush} HACC_FILL_ORDER=${fill_order} HACC_PIPELINE_CHUNKS=${HACC_PIPELINE_CHUNKS:-4}; \
         exec ${TARGET_BIN}; \
       else \
         echo \"[hacc-io-cmp][rank-map] rank=\${SLURM_PROCID} role=proxy host=\${host_name}\"; \
@@ -382,7 +401,20 @@ for mode in ${MODE_LIST}; do
     ompfile-target-local) run_ompfile_target ompfile-target-local "${TARGET_LOCAL_ENV}" 0 0 0 ;;
     ompfile-target-local-async) run_ompfile_target ompfile-target-local-async "${TARGET_LOCAL_ENV}" 0 1 0 ;;
     ompfile-target-local-seg) run_ompfile_target ompfile-target-local-seg "${TARGET_LOCAL_ENV}" 0 0 1 ;;
-    ompfile-target-local-seg-async) run_ompfile_target ompfile-target-local-seg-async "${TARGET_LOCAL_ENV}" 0 1 1 ;;
+    ompfile-target-local-seg-async) run_ompfile_target ompfile-target-local-seg-async "${TARGET_LOCAL_ENV}" 0 1 1 0 0 ;;
+    # Identical to the line above except the buffer fill walks one GLEAN
+    # segment at a time instead of one pass over particles. Kept as the control
+    # that measured the fill traversal to be worth 1.23x of the write phase
+    # (job 414888); it is the slower order, not the default.
+    ompfile-target-local-seg-async-amfill) run_ompfile_target ompfile-target-local-seg-async-amfill "${TARGET_LOCAL_ENV}" 0 1 1 0 0 1 array ;;
+    # Same shape, fill/write pipelined: each proxy generates particle slice
+    # c+1 while the async engine drains slice c. A/B partner of the line above
+    # — same env, same particle-major fill, same bytes; sweep the slice count
+    # with HACC_PIPELINE_CHUNKS (default 4), not HACC_SEG_COUNT.
+    ompfile-target-local-seg-async-pipe) run_ompfile_target ompfile-target-local-seg-async-pipe "${TARGET_LOCAL_ENV}" 0 1 1 0 1 1 ;;
+    # Pipelined without the per-region omp_file_flush: the queued writes drain
+    # at close instead. Ablation partner of the line above.
+    ompfile-target-local-seg-async-pipe-noflush) run_ompfile_target ompfile-target-local-seg-async-pipe-noflush "${TARGET_LOCAL_ENV}" 0 1 1 0 1 0 ;;
     # Same shape with the client-side grouping windows off and the express
     # path on. The bypass serves ops locally, so nobody ever joins the 2 ms
     # write-batch/two-phase windows and they are a pure per-op tax
