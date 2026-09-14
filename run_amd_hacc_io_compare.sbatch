@@ -469,6 +469,14 @@ export LIBOMPFILE_OPT_TWO_PHASE=disabled"
 # Owner-bypass on BOTH directions: kept as a named alias for the IOR lanes —
 # TARGET_LOCAL_ENV now carries the read bypass itself.
 TARGET_LOCAL_RW_ENV="${TARGET_LOCAL_ENV}"
+# Striped bypass I/O: each large bypass pwrite/pread is cut into K concurrent
+# stripes on the proxy. On wekafs a multi-writer file goes write-through and
+# one client's bandwidth scales with its stream count (node-stream-probe
+# 415432: 4.2 -> 6.0 GB/s buffered at four streams; reads 1.8 -> 5.7). Not a
+# runtime default: NFS caps per client stream and only interleaves worse.
+TARGET_LOCAL_STREAMS_ENV="${TARGET_LOCAL_ENV}
+export LIBOMPFILE_OPT_LOCAL_DISJOINT_WRITE_STREAMS=${HACC_WRITE_STREAMS:-4}
+export LIBOMPFILE_OPT_LOCAL_DISJOINT_READ_STREAMS=${HACC_READ_STREAMS:-4}"
 # No-batch bypass: both-direction bypass with the client-side batch windows
 # off. The write-batch and two-phase planners each hold every op in a 2 ms
 # grouping window (kDefault*WindowUs) to merge funnel traffic across ranks —
@@ -531,6 +539,11 @@ for mode in ${MODE_LIST}; do
     # turns it on as well. HACC_SLICES=N overrides "auto".
     ompfile-target-local-seg-async-slice) run_ompfile_target ompfile-target-local-seg-async-slice "${TARGET_LOCAL_ENV}" 0 1 1 0 0 1 particle "${HACC_SLICES:-auto}" ;;
     ompfile-target-local-seg-async-slice-pipe) run_ompfile_target ompfile-target-local-seg-async-slice-pipe "${TARGET_LOCAL_ENV}" 0 1 1 0 1 0 particle "${HACC_SLICES:-auto}" ;;
+    # Sliced dispatch plus striped bypass I/O on the proxy: the sliced arm's
+    # env with LIBOMPFILE_OPT_LOCAL_DISJOINT_{WRITE,READ}_STREAMS (default 4,
+    # HACC_WRITE_STREAMS / HACC_READ_STREAMS override). Its A/B partner is the
+    # -slice line: same dispatch, same ops, only the proxy's drain differs.
+    ompfile-target-local-seg-async-slice-streams) run_ompfile_target ompfile-target-local-seg-async-slice-streams "${TARGET_LOCAL_STREAMS_ENV}" 0 1 1 0 0 1 particle "${HACC_SLICES:-auto}" ;;
     # Same shape with the client-side grouping windows off and the express
     # path on. The bypass serves ops locally, so nobody ever joins the 2 ms
     # write-batch/two-phase windows and they are a pure per-op tax

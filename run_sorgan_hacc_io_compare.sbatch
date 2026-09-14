@@ -385,6 +385,11 @@ export LIBOMPFILE_OPT_LOCAL_DISJOINT_EXPRESS=1 &&"
 # dodge an unrelated intermittent MPI_Testany truncation in that path (see
 # docs/known-issues.md); scoped to this lane so the campaign two-phase story stays.
 TARGET_LOCAL_NOTWOPHASE_ENV="${TARGET_LOCAL_BATCHED_ENV} export LIBOMPFILE_OPT_TWO_PHASE=disabled &&"
+# Striped bypass I/O (see the AMD wrapper): K concurrent stripes per large
+# bypass op on the proxy. A control here — NFS is expected to lose.
+TARGET_LOCAL_STREAMS_ENV="${TARGET_LOCAL_ENV} \
+export LIBOMPFILE_OPT_LOCAL_DISJOINT_WRITE_STREAMS=${HACC_WRITE_STREAMS:-4} && \
+export LIBOMPFILE_OPT_LOCAL_DISJOINT_READ_STREAMS=${HACC_READ_STREAMS:-4} &&"
 # Owner-bypass on BOTH directions: alias — TARGET_LOCAL_ENV now carries the
 # read bypass itself.
 TARGET_LOCAL_RW_ENV="${TARGET_LOCAL_ENV}"
@@ -433,6 +438,11 @@ for mode in ${MODE_LIST}; do
     # becomes 4/4/4 regions instead of 2/1/1 blocks). HACC_SLICES=N overrides.
     ompfile-target-local-seg-async-slice) run_ompfile_target ompfile-target-local-seg-async-slice "${TARGET_LOCAL_ENV}" 0 1 1 0 0 1 particle "${HACC_SLICES:-auto}" ;;
     ompfile-target-local-seg-async-slice-pipe) run_ompfile_target ompfile-target-local-seg-async-slice-pipe "${TARGET_LOCAL_ENV}" 0 1 1 0 1 0 particle "${HACC_SLICES:-auto}" ;;
+    # Sliced dispatch plus striped bypass I/O on the proxy: the sliced arm's
+    # env with LIBOMPFILE_OPT_LOCAL_DISJOINT_{WRITE,READ}_STREAMS (default 4,
+    # HACC_WRITE_STREAMS / HACC_READ_STREAMS override). Its A/B partner is the
+    # -slice line: same dispatch, same ops, only the proxy's drain differs.
+    ompfile-target-local-seg-async-slice-streams) run_ompfile_target ompfile-target-local-seg-async-slice-streams "${TARGET_LOCAL_STREAMS_ENV}" 0 1 1 0 0 1 particle "${HACC_SLICES:-auto}" ;;
     # Same shape with the client-side grouping windows off and the express
     # path on. The bypass serves ops locally, so nobody ever joins the 2 ms
     # write-batch/two-phase windows and they are a pure per-op tax
