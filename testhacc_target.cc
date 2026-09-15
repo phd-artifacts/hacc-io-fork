@@ -42,6 +42,9 @@
 //   HACC_PIPELINE_FLUSH 0 = let close drain the pipelined writes instead of
 //                       ending each region on omp_file_flush. Default 1;
 //                       0 measured faster (job 414886).
+//   HACC_OWNED_SUBMIT   1 = each region hands its nine segment buffers to the
+//                       runtime (omp_file_pwrite_owned, zero-copy, freed by
+//                       the runtime after the write); segmented, non-pipelined
 //   HACC_SLICES         particle slices per logical rank, dealt round-robin
 //                       over devices with a per-device dependence queue
 //                       instead of whole-rank waves (default 1 = waves).
@@ -203,6 +206,28 @@ static void fill_byte_range(unsigned char *buf, int64_t n, int64_t lr,
 // particle index of local element 0, so a slice buffer holding particles
 // [gbase, gbase+n) of its logical rank produces the same bytes the whole-rank
 // buffer would at that position.
+//
+// The traversal is the same whether the nine segments sit back to back in one
+// buffer (the layout below) or in nine buffers of their own (the owned-submit
+// path, which hands each segment to the runtime separately): the loop only
+// ever sees the nine base pointers. fill_particle_arrays is that loop;
+// fill_particle_range derives the pointers from the single-buffer layout.
+static void fill_particle_arrays(float *const *seg_farr, int64_t *pid,
+                                 uint16_t *mask, int64_t lr, int64_t j0,
+                                 int64_t j1, int64_t gbase) {
+  float *farr[7];
+  for (int a = 0; a < 7; ++a)
+    farr[a] = seg_farr[a];
+  for (int64_t j = j0; j < j1; ++j) {
+    const int64_t i = gbase + j;
+    const float f = (float)i;
+    for (int a = 0; a < 7; ++a)
+      farr[a][j] = f;
+    pid[j] = i;
+    mask[j] = (uint16_t)lr;
+  }
+}
+
 static void fill_particle_range(unsigned char *buf, int64_t n, int64_t lr,
                                 int64_t j0, int64_t j1, int64_t gbase) {
   const int64_t float_bytes = n * (int64_t)sizeof(float);
@@ -212,14 +237,7 @@ static void fill_particle_range(unsigned char *buf, int64_t n, int64_t lr,
     farr[a] = (float *)(buf + (int64_t)a * float_bytes);
   int64_t *pid = (int64_t *)(buf + 7 * float_bytes);
   uint16_t *mask = (uint16_t *)(buf + 7 * float_bytes + pid_bytes);
-  for (int64_t j = j0; j < j1; ++j) {
-    const int64_t i = gbase + j;
-    const float f = (float)i;
-    for (int a = 0; a < 7; ++a)
-      farr[a][j] = f;
-    pid[j] = i;
-    mask[j] = (uint16_t)lr;
-  }
+  fill_particle_arrays(farr, pid, mask, lr, j0, j1, gbase);
 }
 #pragma omp end declare target
 
@@ -262,7 +280,7 @@ static int rank_block_target(int device_id, int handle, int64_t lr,
                              int64_t base, bool writing, int io_async,
                              int segmented, int pipeline, int pipeline_flush,
                              int pipeline_chunks, int particle_major_fill,
-                             int *out_errno) {
+                             int owned_submit, int *out_errno) {
   int rc = 0;
   int saved_errno = 0;
   double fill_s = 0.0;
@@ -273,7 +291,8 @@ static int rank_block_target(int device_id, int handle, int64_t lr,
   const double launch_t0 = omp_get_wtime();
 #pragma omp target firstprivate(handle, lr, n, p0, p1, base, writing,          \
                                 io_async, segmented, pipeline, pipeline_flush, \
-                                pipeline_chunks, particle_major_fill)          \
+                                pipeline_chunks, particle_major_fill,          \
+                                owned_submit)                                  \
     device(device_id) map(tofrom : rc, saved_errno, fill_s, issue_s, flush_s,  \
                           region_s)
   {
@@ -302,10 +321,61 @@ static int rank_block_target(int device_id, int handle, int64_t lr,
         local_bytes += n_local * seg_elem[sg];
       }
     }
-    unsigned char *buf = (unsigned char *)malloc((size_t)local_bytes);
-    if (!buf) {
+    // Owned submit: the nine GLEAN segments are generated into nine buffers
+    // of their own and each is handed to the runtime with
+    // omp_file_pwrite_owned, which writes from it in place and frees it once
+    // the write has run. No payload copy on this thread, no flush, and this
+    // region never frees a buffer the runtime accepted. Same bytes at the
+    // same file offsets as the segmented path below; only who owns the
+    // buffer differs. The single-buffer paths keep their one allocation.
+    const bool owned_path = writing && owned_submit != 0 && segmented == 1;
+    unsigned char *buf =
+        owned_path ? nullptr : (unsigned char *)malloc((size_t)local_bytes);
+    if (!owned_path && !buf) {
       rc = 10;
       saved_errno = ENOMEM;
+    } else if (owned_path) {
+#ifdef OMPFILE_HAVE_FILE_PWRITE_OWNED
+      unsigned char *seg_buf[9];
+      for (int sg = 0; sg < 9; ++sg)
+        seg_buf[sg] = nullptr;
+      for (int sg = 0; sg < 9 && rc == 0; ++sg) {
+        seg_buf[sg] = (unsigned char *)malloc((size_t)(n_local * seg_elem[sg]));
+        if (!seg_buf[sg]) {
+          rc = 12;
+          saved_errno = ENOMEM;
+        }
+      }
+      if (rc == 0) {
+        float *seg_farr[7];
+        for (int a = 0; a < 7; ++a)
+          seg_farr[a] = (float *)seg_buf[a];
+        const double fill_t0 = omp_get_wtime();
+        fill_particle_arrays(seg_farr, (int64_t *)seg_buf[7],
+                             (uint16_t *)seg_buf[8], lr, 0, n_local, p0);
+        fill_s += omp_get_wtime() - fill_t0;
+        const double io_t0 = omp_get_wtime();
+        for (int sg = 0; sg < 9 && rc == 0; ++sg) {
+          const int64_t file_off = base + seg_lo_full[sg] + p0 * seg_elem[sg];
+          const int64_t bytes = n_local * seg_elem[sg];
+          const int io_rc = omp_file_pwrite_owned(active_handle, file_off,
+                                                  seg_buf[sg], (size_t)bytes,
+                                                  /*release=*/nullptr);
+          if (io_rc != 0) {
+            rc = 20;
+            saved_errno = errno;
+          } else {
+            seg_buf[sg] = nullptr; // accepted: the runtime owns it now
+          }
+        }
+        issue_s += omp_get_wtime() - io_t0;
+      }
+      // Whatever was not accepted (or never submitted) is still ours.
+      for (int sg = 0; sg < 9; ++sg)
+        free(seg_buf[sg]);
+#else
+      rc = 13; // unreachable: main refuses HACC_OWNED_SUBMIT without the symbol
+#endif
     } else {
       // Pipelining needs more than one chunk to interleave, and only actually
       // overlaps anything when the writes are async — with io_async=0 each
@@ -660,7 +730,7 @@ static int run_phase(const int *handles, int devices, int64_t ranks,
                      int64_t particles, int64_t rank_bytes, bool writing,
                      bool per_rank, int io_async, int segmented, int pipeline,
                      int pipeline_flush, int pipeline_chunks,
-                     int particle_major_fill, int slices) {
+                     int particle_major_fill, int slices, int owned_submit) {
   int failed = 0;
   if (slices <= 1) {
 #pragma omp parallel num_threads(devices) shared(failed)
@@ -682,7 +752,8 @@ static int run_phase(const int *handles, int devices, int64_t ranks,
               const int rc = rank_block_target(
                   device_id, handle, lr, particles, 0, particles, base,
                   writing, io_async, segmented, pipeline, pipeline_flush,
-                  pipeline_chunks, particle_major_fill, &io_errno);
+                  pipeline_chunks, particle_major_fill, owned_submit,
+                  &io_errno);
               if (rc != 0) {
                 fprintf(stderr,
                         "FAIL hacc-target %s lr=%" PRId64
@@ -734,7 +805,7 @@ static int run_phase(const int *handles, int devices, int64_t ranks,
             const int rc = rank_block_target(
                 device_id, handles[device_id], lr, particles, p0, p1, base,
                 writing, io_async, segmented, pipeline, pipeline_flush,
-                pipeline_chunks, particle_major_fill, &io_errno);
+                pipeline_chunks, particle_major_fill, owned_submit, &io_errno);
             if (rc != 0) {
               fprintf(stderr,
                       "FAIL hacc-target %s lr=%" PRId64 " slice=%" PRId64
@@ -814,6 +885,25 @@ int main() {
   // shared file (a per-rank handle is only valid on the device that opened
   // it) and the particle-major fill (the array-major control is whole-rank).
   const int slices = (int)env_i64("HACC_SLICES", 1);
+  // Zero-copy submit: each region generates its nine segments into buffers
+  // the runtime takes ownership of (omp_file_pwrite_owned) instead of the
+  // async engine copying the payload on the issuing thread. Segmented,
+  // non-pipelined shapes only; async by definition, so HACC_IO_ASYNC is
+  // irrelevant to it. Refused outright without the runtime symbol rather
+  // than silently measured as a copying run.
+  const int owned_submit = env_flag("HACC_OWNED_SUBMIT", 0);
+#ifndef OMPFILE_HAVE_FILE_PWRITE_OWNED
+  if (owned_submit) {
+    fprintf(stderr, "FAIL hacc-target: HACC_OWNED_SUBMIT=1 but libompfile has "
+                    "no omp_file_pwrite_owned\n");
+    return 1;
+  }
+#endif
+  if (owned_submit && (segmented != 1 || pipeline)) {
+    fprintf(stderr, "FAIL hacc-target: HACC_OWNED_SUBMIT=1 requires "
+                    "HACC_SEGMENTED=1 and HACC_PIPELINE=0\n");
+    return 1;
+  }
 #ifndef OMPFILE_HAVE_FILE_FLUSH
   if (pipeline && pipeline_flush) {
     fprintf(stderr, "WARN hacc-target: libompfile has no omp_file_flush; "
@@ -908,7 +998,7 @@ int main() {
   if (run_phase(handles, devices, ranks, particles, rank_bytes,
                 /*writing=*/true, /*per_rank=*/file_per_rank != 0, io_async,
                 segmented, pipeline, pipeline_flush, pipeline_chunks,
-                particle_major_fill, slices) != 0)
+                particle_major_fill, slices, owned_submit) != 0)
     return 1;
   if (file_per_rank ? close_rank_handles(ranks, devices, handles)
                     : close_device_handles(devices, handles))
@@ -933,7 +1023,7 @@ int main() {
     if (run_phase(handles, devices, ranks, particles, rank_bytes,
                   /*writing=*/false, /*per_rank=*/file_per_rank != 0, io_async,
                   segmented, pipeline, pipeline_flush, pipeline_chunks,
-                  particle_major_fill, slices) != 0)
+                  particle_major_fill, slices, owned_submit) != 0)
       verified = 0;
     if (file_per_rank ? close_rank_handles(ranks, devices, handles)
                       : close_device_handles(devices, handles))
@@ -951,12 +1041,13 @@ int main() {
          " write_s=%.6f write_mib_s=%.3f fill_s=%.6f issue_s=%.6f "
          "flush_s=%.6f region_s=%.6f read_s=%.6f read_mib_s=%.3f "
          "verified=%d concurrency=%d pipeline=%d pipeline_flush=%d "
-         "fill_order=%s pipeline_chunks=%d slices=%d launch_s=%.6f\n",
+         "fill_order=%s pipeline_chunks=%d slices=%d launch_s=%.6f "
+         "owned_submit=%d\n",
          file_per_rank ? "ompfile_target_fpr" : "ompfile_target", ranks,
          particles, total_bytes, write_s, write_mib, w_fill_s, w_issue_s,
          w_flush_s, w_region_s, read_s, read_mib, verified, devices, pipeline,
          pipeline_flush, particle_major_fill ? "particle" : "array",
-         pipeline_chunks, slices, w_launch_s);
+         pipeline_chunks, slices, w_launch_s, owned_submit);
   printf(" CONTENTS VERIFIED... Success \n"); // match upstream success marker
   if (fpr_paths) {
     for (int64_t lr = 0; lr < ranks; ++lr)

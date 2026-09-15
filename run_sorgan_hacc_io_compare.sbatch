@@ -52,6 +52,14 @@ fi
 COMPARE_MODES_RAW="${HACC_COMPARE_MODES:-posix,mpiio,ompfile-wt,ompfile-wb}"
 COMPARE_PARTICLES="${HACC_COMPARE_PARTICLES:-2000000}"
 COMPARE_TASKS="${HACC_COMPARE_TASKS:-${SLURM_NTASKS}}"
+# Equal-writer lane, same knobs as the AMD wrapper: the OMPFILE variants
+# emulate HACC_COMPARE_LOGICAL_RANKS logical ranks (default one per task) and
+# the SPMD baselines run HACC_BASELINE_TASKS ranks (default COMPARE_TASKS), one
+# per node. N logical ranks + N baseline tasks on an N+1 task allocation gives
+# both arms N storage writers over the same bytes; the split-role arm uses one
+# more node, so report that row beside the same-node-count one.
+COMPARE_LOGICAL_RANKS="${HACC_COMPARE_LOGICAL_RANKS:-${COMPARE_TASKS}}"
+BASELINE_TASKS="${HACC_BASELINE_TASKS:-${COMPARE_TASKS}}"
 COMPARE_OUTDIR="${HACC_COMPARE_OUTDIR:-${HACC_DIR}/tmp/backend-compare-slurm-${SLURM_JOB_ID}}"
 COMPARE_CLEAN_DATA="${HACC_COMPARE_CLEAN_DATA:-1}"
 # Concurrent-issue lanes: issuer threads over logical ranks (default = one
@@ -69,6 +77,14 @@ if [[ ! "${COMPARE_PARTICLES}" =~ ^[0-9]+$ ]] || (( COMPARE_PARTICLES < 1 )); th
 fi
 if (( COMPARE_TASKS < 2 )); then
   echo "Error: HACC compare requires at least 2 tasks (split-role needs 1 app + >=1 proxy)." >&2
+  exit 1
+fi
+if [[ ! "${COMPARE_LOGICAL_RANKS}" =~ ^[0-9]+$ ]] || (( COMPARE_LOGICAL_RANKS < 1 )); then
+  echo "Error: HACC_COMPARE_LOGICAL_RANKS must be a positive integer, got '${COMPARE_LOGICAL_RANKS}'." >&2
+  exit 1
+fi
+if [[ ! "${BASELINE_TASKS}" =~ ^[0-9]+$ ]] || (( BASELINE_TASKS < 1 || BASELINE_TASKS > COMPARE_TASKS )); then
+  echo "Error: HACC_BASELINE_TASKS must be between 1 and HACC_COMPARE_TASKS (${COMPARE_TASKS}), got '${BASELINE_TASKS}'." >&2
   exit 1
 fi
 if [[ ! -x "${APPTAINER_BIN}" ]]; then
@@ -129,7 +145,7 @@ chmod +x "${APPTAINER_NODE_EXEC}"
 SUMMARY_CSV="${COMPARE_OUTDIR}/hacc-io-summary.csv"
 # Columns 1-10 are positional for the SPINNER_HACC_IO awk below; the
 # write-phase device-side breakdown is appended after them so that stays true.
-echo "mode,interface,logical_ranks,particles_per_rank,bytes,write_s,write_mib_s,read_s,read_mib_s,verified,fill_s,issue_s,flush_s,region_s,pipeline,fill_order,pipeline_chunks,slices,launch_s" > "${SUMMARY_CSV}"
+echo "mode,interface,logical_ranks,particles_per_rank,bytes,write_s,write_mib_s,read_s,read_mib_s,verified,fill_s,issue_s,flush_s,region_s,pipeline,fill_order,pipeline_chunks,slices,launch_s,owned_submit" > "${SUMMARY_CSV}"
 IOR_TARGET_CSV="${COMPARE_OUTDIR}/ior-target-summary.csv"
 echo "mode,writers,devices,transfer_bytes,block_bytes,total_bytes,shared,read_shift,write_open_s,write_s,write_close_s,write_mib_s,read_open_s,read_s,read_close_s,read_mib_s,verified" > "${IOR_TARGET_CSV}"
 # ior-target geometry (IOR -F equivalents; block matches the sorgan IOR lane)
@@ -137,7 +153,7 @@ IORT_TRANSFER_BYTES="${IORT_TRANSFER_BYTES:-1048576}"
 IORT_BLOCK_BYTES="${IORT_BLOCK_BYTES:-16777216}"
 
 echo "[hacc-io-cmp] allocated nodes: ${SLURM_JOB_NODELIST}"
-echo "[hacc-io-cmp] particles/rank=${COMPARE_PARTICLES} tasks=${COMPARE_TASKS} modes=${COMPARE_MODES_RAW}"
+echo "[hacc-io-cmp] particles/rank=${COMPARE_PARTICLES} tasks=${COMPARE_TASKS} logical_ranks=${COMPARE_LOGICAL_RANKS} baseline_tasks=${BASELINE_TASKS} modes=${COMPARE_MODES_RAW}"
 
 collect_summary() { # log_file mode
   local line
@@ -149,7 +165,7 @@ collect_summary() { # log_file mode
   fi
   local get
   get() { echo "${line}" | grep -oE "$1=[^ ]+" | head -1 | cut -d= -f2; }
-  echo "$2,$(get interface),$(get logical_ranks),$(get particles_per_rank),$(get bytes),$(get write_s),$(get write_mib_s),$(get read_s),$(get read_mib_s),$(get verified),$(get fill_s),$(get issue_s),$(get flush_s),$(get region_s),$(get pipeline),$(get fill_order),$(get pipeline_chunks),$(get slices),$(get launch_s)" >> "${SUMMARY_CSV}"
+  echo "$2,$(get interface),$(get logical_ranks),$(get particles_per_rank),$(get bytes),$(get write_s),$(get write_mib_s),$(get read_s),$(get read_mib_s),$(get verified),$(get fill_s),$(get issue_s),$(get flush_s),$(get region_s),$(get pipeline),$(get fill_order),$(get pipeline_chunks),$(get slices),$(get launch_s),$(get owned_submit)" >> "${SUMMARY_CSV}"
 }
 
 run_baseline() { # mode (posix|mpiio)
@@ -158,8 +174,8 @@ run_baseline() { # mode (posix|mpiio)
   [[ "${mode}" == "mpiio" ]] && ifname="mpiio"
   local log_file="${COMPARE_OUTDIR}/${mode}.log"
   local data_path="${COMPARE_OUTDIR}/data-${mode}"
-  echo "[hacc-io-cmp] baseline ${mode} (${COMPARE_TASKS} SPMD ranks)"
-  srun --kill-on-bad-exit=1 --mpi=pmi2 --nodes="${RUN_NODES}" --ntasks="${COMPARE_TASKS}" \
+  echo "[hacc-io-cmp] baseline ${mode} (${BASELINE_TASKS} SPMD ranks, one per node)"
+  srun --kill-on-bad-exit=1 --mpi=pmi2 --nodes="${BASELINE_TASKS}" --ntasks="${BASELINE_TASKS}" \
     "${APPTAINER_NODE_EXEC}" \
     bash -lc "${COMMON_ENV} && unset LIBOMPFILE_BACKEND LIBOMPFILE_SCHEDULER LIBOMPFILE_MPP_OPEN LIBOMPFILE_MPP_IO LIBOMPFILE_MPP_PING LIBOMPFILE_OPT_OPEN_CACHE LIBOMPFILE_OPT_OPEN_CACHE_KEEP_OPEN LIBOMPFILE_OPT_STATS UCX_TLS UCX_POSIX_USE_PROC_LINK; export HACC_IO_INTERFACE=${ifname}; export HACC_FSYNC_ON_CLOSE=${HACC_BASELINE_FSYNC:-0}; ${BASELINE_BIN} ${COMPARE_PARTICLES} ${data_path}" \
     > "${log_file}" 2>&1 || { echo "Error: baseline ${mode} failed" >&2; tail -n 40 "${log_file}" >&2; exit 1; }
@@ -176,7 +192,7 @@ run_ompfile() { # mode (ompfile-wt|ompfile-wb[-conc]) extra_env_stmt [concurrenc
   local conc="${3:-1}"
   local log_file="${COMPARE_OUTDIR}/${mode}.log"
   local data_path="${COMPARE_OUTDIR}/data-${mode}"
-  echo "[hacc-io-cmp] ${mode} split-role (1 app + $((COMPARE_TASKS - 1)) proxies, logical_ranks=${COMPARE_TASKS}, concurrency=${conc})"
+  echo "[hacc-io-cmp] ${mode} split-role (1 app + $((COMPARE_TASKS - 1)) proxies, logical_ranks=${COMPARE_LOGICAL_RANKS}, concurrency=${conc})"
   srun --kill-on-bad-exit=1 --mpi=pmi2 --nodes="${RUN_NODES}" --ntasks="${COMPARE_TASKS}" \
     "${APPTAINER_NODE_EXEC}" \
     bash -lc "${COMMON_ENV} && \
@@ -196,7 +212,7 @@ run_ompfile() { # mode (ompfile-wt|ompfile-wb[-conc]) extra_env_stmt [concurrenc
       host_name=\$(hostname -s); \
       if [ \"\${SLURM_PROCID}\" -eq $((COMPARE_TASKS - 1)) ]; then \
         echo \"[hacc-io-cmp][rank-map] rank=\${SLURM_PROCID} role=app host=\${host_name}\"; \
-        export HACC_FILE=${data_path} HACC_RANKS=${COMPARE_TASKS} HACC_PARTICLES=${COMPARE_PARTICLES} HACC_CONCURRENCY=${conc}; \
+        export HACC_FILE=${data_path} HACC_RANKS=${COMPARE_LOGICAL_RANKS} HACC_PARTICLES=${COMPARE_PARTICLES} HACC_CONCURRENCY=${conc}; \
         exec ${OMPFILE_BIN}; \
       else \
         echo \"[hacc-io-cmp][rank-map] rank=\${SLURM_PROCID} role=proxy host=\${host_name}\"; \
@@ -210,7 +226,7 @@ run_ompfile() { # mode (ompfile-wt|ompfile-wb[-conc]) extra_env_stmt [concurrenc
   fi
 }
 
-run_ompfile_target() { # mode extra_env [fpr] [async] [segmented] [concurrent] [pipeline] [pipeline_flush] [fill_order] [slices]
+run_ompfile_target() { # mode extra_env [fpr] [async] [segmented] [concurrent] [pipeline] [pipeline_flush] [fill_order] [slices] [owned]
   local mode="$1"
   local extra_env="$2"
   local fpr="${3:-0}"
@@ -239,6 +255,9 @@ run_ompfile_target() { # mode extra_env [fpr] [async] [segmented] [concurrent] [
   # proxy. Only the segmented shared-file modes may set it.
   local slices="${10:-1}"
   if [[ "${slices}" == "auto" ]]; then slices=$((COMPARE_TASKS - 1)); fi
+  # Owned (zero-copy) submit, as on the AMD wrapper: segmented, non-pipelined
+  # shapes only; the region hands its nine segment buffers to the runtime.
+  local owned="${11:-0}"
   # Sliced regions overlap through the async queue, which must hold two
   # regions' worth of writes (9 each) rather than the runtime default of 2.
   # Same "export ... &&" shape as the extra_env blocks it is appended to.
@@ -248,7 +267,7 @@ run_ompfile_target() { # mode extra_env [fpr] [async] [segmented] [concurrent] [
   fi
   local log_file="${COMPARE_OUTDIR}/${mode}.log"
   local data_path="${COMPARE_OUTDIR}/data-${mode}"
-  echo "[hacc-io-cmp] ${mode} target-region issuers (1 app + $((COMPARE_TASKS - 1)) proxies, logical_ranks=${COMPARE_TASKS}, data generated device-side)"
+  echo "[hacc-io-cmp] ${mode} target-region issuers (1 app + $((COMPARE_TASKS - 1)) proxies, logical_ranks=${COMPARE_LOGICAL_RANKS}, data generated device-side)"
   srun --kill-on-bad-exit=1 --mpi=pmi2 --nodes="${RUN_NODES}" --ntasks="${COMPARE_TASKS}" \
     "${APPTAINER_NODE_EXEC}" \
     bash -lc "${COMMON_ENV} && \
@@ -269,7 +288,7 @@ run_ompfile_target() { # mode extra_env [fpr] [async] [segmented] [concurrent] [
       host_name=\$(hostname -s); \
       if [ \"\${SLURM_PROCID}\" -eq $((COMPARE_TASKS - 1)) ]; then \
         echo \"[hacc-io-cmp][rank-map] rank=\${SLURM_PROCID} role=app host=\${host_name}\"; \
-        export HACC_FILE=${data_path} HACC_RANKS=${COMPARE_TASKS} HACC_PARTICLES=${COMPARE_PARTICLES} HACC_FILE_PER_RANK=${fpr} HACC_IO_ASYNC=${async} HACC_SEGMENTED=${segmented} HACC_CONCURRENT_OPEN=${concurrent} HACC_PIPELINE=${pipeline} HACC_PIPELINE_FLUSH=${pipeline_flush} HACC_FILL_ORDER=${fill_order} HACC_PIPELINE_CHUNKS=${HACC_PIPELINE_CHUNKS:-4} HACC_SLICES=${slices}; \
+        export HACC_FILE=${data_path} HACC_RANKS=${COMPARE_LOGICAL_RANKS} HACC_PARTICLES=${COMPARE_PARTICLES} HACC_FILE_PER_RANK=${fpr} HACC_IO_ASYNC=${async} HACC_SEGMENTED=${segmented} HACC_CONCURRENT_OPEN=${concurrent} HACC_PIPELINE=${pipeline} HACC_PIPELINE_FLUSH=${pipeline_flush} HACC_FILL_ORDER=${fill_order} HACC_PIPELINE_CHUNKS=${HACC_PIPELINE_CHUNKS:-4} HACC_SLICES=${slices} HACC_OWNED_SUBMIT=${owned}; \
         exec ${TARGET_BIN}; \
       else \
         echo \"[hacc-io-cmp][rank-map] rank=\${SLURM_PROCID} role=proxy host=\${host_name}\"; \
@@ -277,6 +296,17 @@ run_ompfile_target() { # mode extra_env [fpr] [async] [segmented] [concurrent] [
       fi" \
     > "${log_file}" 2>&1 || { echo "Error: ${mode} failed" >&2; tail -n 60 "${log_file}" >&2; exit 1; }
   grep -q 'CONTENTS VERIFIED' "${log_file}" || { echo "Error: ${mode} did not verify" >&2; tail -n 60 "${log_file}" >&2; exit 1; }
+  if [[ "${owned}" == "1" ]]; then
+    # Fail closed: the proxies' async engines report owned submits on their
+    # exit stats line, or the arm ran the copying path under the owned label.
+    local owned_enqueued
+    owned_enqueued="$(grep -ao 'owned_enqueued=[0-9]*' "${log_file}" | cut -d= -f2 | awk '{ s += $1 } END { printf "%.0f", s + 0 }')"
+    if [[ "${owned_enqueued:-0}" -lt 1 ]]; then
+      echo "Error: ${mode} did not engage the owned submit (owned_enqueued=${owned_enqueued:-0})" >&2
+      exit 1
+    fi
+    echo "[hacc-io-cmp] ${mode} owned_enqueued=${owned_enqueued}"
+  fi
   collect_summary "${log_file}" "${mode}"
   if [[ "${COMPARE_CLEAN_DATA}" == "1" ]]; then
     rm -f "${data_path}"*
@@ -443,6 +473,11 @@ for mode in ${MODE_LIST}; do
     # HACC_WRITE_STREAMS / HACC_READ_STREAMS override). Its A/B partner is the
     # -slice line: same dispatch, same ops, only the proxy's drain differs.
     ompfile-target-local-seg-async-slice-streams) run_ompfile_target ompfile-target-local-seg-async-slice-streams "${TARGET_LOCAL_STREAMS_ENV}" 0 1 1 0 0 1 particle "${HACC_SLICES:-auto}" ;;
+    # Owned (zero-copy) submit on the two sliced arms: same env and dispatch,
+    # each region generates its segments into buffers the runtime takes
+    # ownership of. A/B partners are the two lines above.
+    ompfile-target-local-seg-async-slice-owned) run_ompfile_target ompfile-target-local-seg-async-slice-owned "${TARGET_LOCAL_ENV}" 0 1 1 0 0 1 particle "${HACC_SLICES:-auto}" 1 ;;
+    ompfile-target-local-seg-async-slice-streams-owned) run_ompfile_target ompfile-target-local-seg-async-slice-streams-owned "${TARGET_LOCAL_STREAMS_ENV}" 0 1 1 0 0 1 particle "${HACC_SLICES:-auto}" 1 ;;
     # Same shape with the client-side grouping windows off and the express
     # path on. The bypass serves ops locally, so nobody ever joins the 2 ms
     # write-batch/two-phase windows and they are a pure per-op tax

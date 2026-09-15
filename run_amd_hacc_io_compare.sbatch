@@ -14,6 +14,13 @@
 # container via a role script, srun --mpi=pmix, host spack MPICH override
 # (container MPICH's PMIx client silently singletons on this cluster —
 # jobs 350109-350170), and PMIx server tmpdir bind.
+#
+# Equal-writer lane: the split-role arm has COMPARE_TASKS-1 storage writers
+# (the app rank issues, the proxies write), so at the same task count it runs
+# one writer short of the SPMD baseline. HACC_COMPARE_LOGICAL_RANKS=N with
+# HACC_BASELINE_TASKS=N on an N+1 task allocation gives both arms N writers
+# over the same N x rank_bytes — the baseline on N of the N+1 nodes. Report it
+# beside, never instead of, the same-node-count row: it uses one more node.
 
 set -euo pipefail
 
@@ -48,6 +55,17 @@ fi
 COMPARE_MODES_RAW="${HACC_COMPARE_MODES:-posix,mpiio,ompfile-wt,ompfile-wb}"
 COMPARE_PARTICLES="${HACC_COMPARE_PARTICLES:-2000000}"
 COMPARE_TASKS="${HACC_COMPARE_TASKS:-${SLURM_NTASKS}}"
+# Logical SPMD ranks the OMPFILE variants emulate (HACC_RANKS). Default = one
+# per task, so aggregate bytes match a baseline of COMPARE_TASKS ranks. The
+# equal-writer lane pins it to the baseline's rank count and gives the
+# split-role arm one extra task (the app rank), so both arms have the same
+# number of storage writers — N proxies vs N MPI ranks — over the same bytes.
+COMPARE_LOGICAL_RANKS="${HACC_COMPARE_LOGICAL_RANKS:-${COMPARE_TASKS}}"
+# SPMD baseline (posix/mpiio) task count. Default = COMPARE_TASKS; the
+# equal-writer lane sets it to COMPARE_LOGICAL_RANKS so the baseline runs on
+# that many of the allocation's nodes, one rank per node, and writes the same
+# COMPARE_LOGICAL_RANKS x rank_bytes the OMPFILE arm does.
+BASELINE_TASKS="${HACC_BASELINE_TASKS:-${COMPARE_TASKS}}"
 COMPARE_OUTDIR="${HACC_COMPARE_OUTDIR:-${HACC_DIR}/tmp/backend-compare-amd-${SLURM_JOB_ID}}"
 COMPARE_CLEAN_DATA="${HACC_COMPARE_CLEAN_DATA:-1}"
 # Concurrent-issue lanes: issuer threads over logical ranks (default = one
@@ -77,6 +95,14 @@ if [[ ! "${RUN_NODES}" =~ ^[0-9]+$ ]] || (( RUN_NODES < 1 || RUN_NODES > COMPARE
   echo "Error: HACC_COMPARE_NODES must be between 1 and HACC_COMPARE_TASKS (${COMPARE_TASKS}), got '${RUN_NODES}'." >&2
   exit 1
 fi
+if [[ ! "${COMPARE_LOGICAL_RANKS}" =~ ^[0-9]+$ ]] || (( COMPARE_LOGICAL_RANKS < 1 )); then
+  echo "Error: HACC_COMPARE_LOGICAL_RANKS must be a positive integer, got '${COMPARE_LOGICAL_RANKS}'." >&2
+  exit 1
+fi
+if [[ ! "${BASELINE_TASKS}" =~ ^[0-9]+$ ]] || (( BASELINE_TASKS < 1 || BASELINE_TASKS > COMPARE_TASKS )); then
+  echo "Error: HACC_BASELINE_TASKS must be between 1 and HACC_COMPARE_TASKS (${COMPARE_TASKS}), got '${BASELINE_TASKS}'." >&2
+  exit 1
+fi
 if [[ ! -e "${CONTAINER_IMAGE}" ]]; then
   echo "Error: Apptainer image not found under ${REPO_ROOT}" >&2
   exit 1
@@ -91,6 +117,17 @@ if (( RUN_NODES == COMPARE_TASKS )); then
   SRUN_PLACEMENT+=(--ntasks-per-node=1)
 else
   SRUN_PLACEMENT+=(--distribution=block:block)
+fi
+# The baseline's own placement: one rank per node when the allocation has a
+# node per baseline task (the equal-writer lane: 4 ranks on 4 of 5 nodes),
+# otherwise packed like the split-role step (single-node preflights).
+BASELINE_NODES="${BASELINE_TASKS}"
+if (( BASELINE_NODES > RUN_NODES )); then BASELINE_NODES="${RUN_NODES}"; fi
+BASELINE_PLACEMENT=(--nodes="${BASELINE_NODES}" --ntasks="${BASELINE_TASKS}")
+if (( BASELINE_NODES == BASELINE_TASKS )); then
+  BASELINE_PLACEMENT+=(--ntasks-per-node=1)
+else
+  BASELINE_PLACEMENT+=(--distribution=block:block)
 fi
 
 # Host spack MPICH (pmi=pmix, cluster-matched) — required for every rank so
@@ -112,7 +149,7 @@ mkdir -p "${COMPARE_OUTDIR}"
 SUMMARY_CSV="${COMPARE_OUTDIR}/hacc-io-summary.csv"
 # Columns 1-10 are positional for the SPINNER_HACC_IO awk below; the
 # write-phase device-side breakdown is appended after them so that stays true.
-echo "mode,interface,logical_ranks,particles_per_rank,bytes,write_s,write_mib_s,read_s,read_mib_s,verified,fill_s,issue_s,flush_s,region_s,pipeline,fill_order,pipeline_chunks,slices,launch_s" > "${SUMMARY_CSV}"
+echo "mode,interface,logical_ranks,particles_per_rank,bytes,write_s,write_mib_s,read_s,read_mib_s,verified,fill_s,issue_s,flush_s,region_s,pipeline,fill_order,pipeline_chunks,slices,launch_s,owned_submit" > "${SUMMARY_CSV}"
 IOR_TARGET_CSV="${COMPARE_OUTDIR}/ior-target-summary.csv"
 echo "mode,writers,devices,transfer_bytes,block_bytes,total_bytes,shared,read_shift,write_open_s,write_s,write_close_s,write_mib_s,read_open_s,read_s,read_close_s,read_mib_s,verified" > "${IOR_TARGET_CSV}"
 # ior-target geometry (IOR -F equivalents; block matches the AMD IOR lane)
@@ -120,7 +157,7 @@ IORT_TRANSFER_BYTES="${IORT_TRANSFER_BYTES:-1048576}"
 IORT_BLOCK_BYTES="${IORT_BLOCK_BYTES:-134217728}"
 
 echo "[amd-hacc-io-cmp] allocated nodes: ${SLURM_JOB_NODELIST}"
-echo "[amd-hacc-io-cmp] particles/rank=${COMPARE_PARTICLES} tasks=${COMPARE_TASKS} modes=${COMPARE_MODES_RAW}"
+echo "[amd-hacc-io-cmp] particles/rank=${COMPARE_PARTICLES} tasks=${COMPARE_TASKS} nodes=${RUN_NODES} logical_ranks=${COMPARE_LOGICAL_RANKS} baseline_tasks=${BASELINE_TASKS} baseline_nodes=${BASELINE_NODES} modes=${COMPARE_MODES_RAW}"
 
 in_container_build() {
   local binds="${PROJECT_ROOT},${REPO_ROOT},${HOME}"
@@ -153,7 +190,7 @@ collect_summary() { # log_file mode
   fi
   local get
   get() { echo "${line}" | grep -oE "$1=[^ ]+" | head -1 | cut -d= -f2; }
-  echo "$2,$(get interface),$(get logical_ranks),$(get particles_per_rank),$(get bytes),$(get write_s),$(get write_mib_s),$(get read_s),$(get read_mib_s),$(get verified),$(get fill_s),$(get issue_s),$(get flush_s),$(get region_s),$(get pipeline),$(get fill_order),$(get pipeline_chunks),$(get slices),$(get launch_s)" >> "${SUMMARY_CSV}"
+  echo "$2,$(get interface),$(get logical_ranks),$(get particles_per_rank),$(get bytes),$(get write_s),$(get write_mib_s),$(get read_s),$(get read_mib_s),$(get verified),$(get fill_s),$(get issue_s),$(get flush_s),$(get region_s),$(get pipeline),$(get fill_order),$(get pipeline_chunks),$(get slices),$(get launch_s),$(get owned_submit)" >> "${SUMMARY_CSV}"
 }
 
 # Role script: every rank re-enters the container with the PMIx server bind
@@ -197,7 +234,7 @@ run_baseline() { # mode (posix|mpiio)
   local log_file="${COMPARE_OUTDIR}/${mode}.log"
   local data_path="${COMPARE_OUTDIR}/data-${mode}"
   local role_path="${COMPARE_OUTDIR}/role-${mode}.sh"
-  echo "[amd-hacc-io-cmp] baseline ${mode} (${COMPARE_TASKS} SPMD ranks)"
+  echo "[amd-hacc-io-cmp] baseline ${mode} (${BASELINE_TASKS} SPMD ranks on ${BASELINE_NODES} nodes)"
   # run_in_container execs the target directly — wrap binary+args in a helper:
   cat > "${COMPARE_OUTDIR}/exec-${mode}.sh" <<EOF
 #!/usr/bin/env bash
@@ -210,7 +247,7 @@ EOF
     "export HACC_IO_INTERFACE=${ifname}
 export HACC_FSYNC_ON_CLOSE=${HACC_BASELINE_FSYNC:-0}" \
     "run_in_container \"${COMPARE_OUTDIR}/exec-${mode}.sh\""
-  srun --kill-on-bad-exit=1 --mpi="${RUN_MPI_TYPE}" "${SRUN_PLACEMENT[@]}" \
+  srun --kill-on-bad-exit=1 --mpi="${RUN_MPI_TYPE}" "${BASELINE_PLACEMENT[@]}" \
     "${role_path}" > "${log_file}" 2>&1 || { echo "Error: baseline ${mode} failed" >&2; tail -n 40 "${log_file}" >&2; exit 1; }
   grep -q 'CONTENTS VERIFIED' "${log_file}" || { echo "Error: baseline ${mode} did not verify" >&2; tail -n 40 "${log_file}" >&2; exit 1; }
   collect_summary "${log_file}" "${mode}"
@@ -226,10 +263,10 @@ run_ompfile() { # mode (ompfile-wt|ompfile-wb[-conc]) extra_env_stmt [concurrenc
   local log_file="${COMPARE_OUTDIR}/${mode}.log"
   local data_path="${COMPARE_OUTDIR}/data-${mode}"
   local role_path="${COMPARE_OUTDIR}/role-${mode}.sh"
-  echo "[amd-hacc-io-cmp] ${mode} split-role (1 app + $((COMPARE_TASKS - 1)) proxies, logical_ranks=${COMPARE_TASKS}, concurrency=${conc})"
+  echo "[amd-hacc-io-cmp] ${mode} split-role (1 app + $((COMPARE_TASKS - 1)) proxies, logical_ranks=${COMPARE_LOGICAL_RANKS}, concurrency=${conc})"
   cat > "${COMPARE_OUTDIR}/exec-app-${mode}.sh" <<EOF
 #!/usr/bin/env bash
-export HACC_FILE="${data_path}" HACC_RANKS="${COMPARE_TASKS}" HACC_PARTICLES="${COMPARE_PARTICLES}"
+export HACC_FILE="${data_path}" HACC_RANKS="${COMPARE_LOGICAL_RANKS}" HACC_PARTICLES="${COMPARE_PARTICLES}"
 export HACC_CONCURRENCY="${conc}"
 exec "${OMPFILE_BIN}"
 EOF
@@ -262,7 +299,7 @@ fi"
   fi
 }
 
-run_ompfile_target() { # mode extra_env [fpr] [async] [segmented] [concurrent] [pipeline] [pipeline_flush] [fill_order] [slices]
+run_ompfile_target() { # mode extra_env [fpr] [async] [segmented] [concurrent] [pipeline] [pipeline_flush] [fill_order] [slices] [owned]
   local mode="$1"
   local extra_env="$2"
   local fpr="${3:-0}"
@@ -292,6 +329,10 @@ run_ompfile_target() { # mode extra_env [fpr] [async] [segmented] [concurrent] [
   # regions. Only the segmented shared-file modes may set it.
   local slices="${10:-1}"
   if [[ "${slices}" == "auto" ]]; then slices=$((COMPARE_TASKS - 1)); fi
+  # Owned (zero-copy) submit: the region hands its nine segment buffers to
+  # the runtime (omp_file_pwrite_owned) instead of the async engine copying
+  # them on the issuing thread. Segmented, non-pipelined shapes only.
+  local owned="${11:-0}"
   # A sliced region issues nine writes and returns; the next region's fill
   # overlaps their drain only if the async queue can hold them, so the sliced
   # modes deepen it from the runtime default of 2 to two regions' worth.
@@ -302,10 +343,10 @@ run_ompfile_target() { # mode extra_env [fpr] [async] [segmented] [concurrent] [
   local log_file="${COMPARE_OUTDIR}/${mode}.log"
   local data_path="${COMPARE_OUTDIR}/data-${mode}"
   local role_path="${COMPARE_OUTDIR}/role-${mode}.sh"
-  echo "[amd-hacc-io-cmp] ${mode} target-region issuers (1 app + $((COMPARE_TASKS - 1)) proxies, logical_ranks=${COMPARE_TASKS}, data generated device-side)"
+  echo "[amd-hacc-io-cmp] ${mode} target-region issuers (1 app + $((COMPARE_TASKS - 1)) proxies, logical_ranks=${COMPARE_LOGICAL_RANKS}, data generated device-side)"
   cat > "${COMPARE_OUTDIR}/exec-app-${mode}.sh" <<EOF
 #!/usr/bin/env bash
-export HACC_FILE="${data_path}" HACC_RANKS="${COMPARE_TASKS}" HACC_PARTICLES="${COMPARE_PARTICLES}" HACC_FILE_PER_RANK="${fpr}" HACC_IO_ASYNC="${async}" HACC_SEGMENTED="${segmented}" HACC_CONCURRENT_OPEN="${concurrent}" HACC_PIPELINE="${pipeline}" HACC_PIPELINE_FLUSH="${pipeline_flush}" HACC_FILL_ORDER="${fill_order}" HACC_PIPELINE_CHUNKS="${HACC_PIPELINE_CHUNKS:-4}" HACC_SLICES="${slices}"
+export HACC_FILE="${data_path}" HACC_RANKS="${COMPARE_LOGICAL_RANKS}" HACC_PARTICLES="${COMPARE_PARTICLES}" HACC_FILE_PER_RANK="${fpr}" HACC_IO_ASYNC="${async}" HACC_SEGMENTED="${segmented}" HACC_CONCURRENT_OPEN="${concurrent}" HACC_PIPELINE="${pipeline}" HACC_PIPELINE_FLUSH="${pipeline_flush}" HACC_FILL_ORDER="${fill_order}" HACC_PIPELINE_CHUNKS="${HACC_PIPELINE_CHUNKS:-4}" HACC_SLICES="${slices}" HACC_OWNED_SUBMIT="${owned}"
 exec "${TARGET_BIN}"
 EOF
   chmod +x "${COMPARE_OUTDIR}/exec-app-${mode}.sh"
@@ -332,6 +373,17 @@ fi"
   srun --kill-on-bad-exit=1 --mpi="${RUN_MPI_TYPE}" "${SRUN_PLACEMENT[@]}" \
     "${role_path}" > "${log_file}" 2>&1 || { echo "Error: ${mode} failed" >&2; tail -n 60 "${log_file}" >&2; exit 1; }
   grep -q 'CONTENTS VERIFIED' "${log_file}" || { echo "Error: ${mode} did not verify" >&2; tail -n 60 "${log_file}" >&2; exit 1; }
+  if [[ "${owned}" == "1" ]]; then
+    # Fail closed: the proxies' async engines report owned submits on their
+    # exit stats line, or the arm ran the copying path under the owned label.
+    local owned_enqueued
+    owned_enqueued="$(grep -ao 'owned_enqueued=[0-9]*' "${log_file}" | cut -d= -f2 | awk '{ s += $1 } END { printf "%.0f", s + 0 }')"
+    if [[ "${owned_enqueued:-0}" -lt 1 ]]; then
+      echo "Error: ${mode} did not engage the owned submit (owned_enqueued=${owned_enqueued:-0})" >&2
+      exit 1
+    fi
+    echo "[amd-hacc-io-cmp] ${mode} owned_enqueued=${owned_enqueued}"
+  fi
   collect_summary "${log_file}" "${mode}"
   if [[ "${COMPARE_CLEAN_DATA}" == "1" ]]; then
     rm -f "${data_path}"*
@@ -544,6 +596,14 @@ for mode in ${MODE_LIST}; do
     # HACC_WRITE_STREAMS / HACC_READ_STREAMS override). Its A/B partner is the
     # -slice line: same dispatch, same ops, only the proxy's drain differs.
     ompfile-target-local-seg-async-slice-streams) run_ompfile_target ompfile-target-local-seg-async-slice-streams "${TARGET_LOCAL_STREAMS_ENV}" 0 1 1 0 0 1 particle "${HACC_SLICES:-auto}" ;;
+    # Owned (zero-copy) submit on the two sliced arms above: same env, same
+    # dispatch, same nine writes per region, but each region generates its
+    # segments into buffers the runtime takes ownership of, so the issuing
+    # thread pays no payload copy. A/B partners are the two lines above; the
+    # streams pair is the one that matters (the drain is striped, so the copy
+    # is what bounds the phase — job 415443's region breakdown).
+    ompfile-target-local-seg-async-slice-owned) run_ompfile_target ompfile-target-local-seg-async-slice-owned "${TARGET_LOCAL_ENV}" 0 1 1 0 0 1 particle "${HACC_SLICES:-auto}" 1 ;;
+    ompfile-target-local-seg-async-slice-streams-owned) run_ompfile_target ompfile-target-local-seg-async-slice-streams-owned "${TARGET_LOCAL_STREAMS_ENV}" 0 1 1 0 0 1 particle "${HACC_SLICES:-auto}" 1 ;;
     # Same shape with the client-side grouping windows off and the express
     # path on. The bypass serves ops locally, so nobody ever joins the 2 ms
     # write-batch/two-phase windows and they are a pure per-op tax
