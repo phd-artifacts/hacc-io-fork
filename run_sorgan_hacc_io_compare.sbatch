@@ -69,7 +69,6 @@ COMPARE_CONCURRENCY="${HACC_COMPARE_CONCURRENCY:-${COMPARE_TASKS}}"
 # node count must follow COMPARE_TASKS or srun rejects the step.
 RUN_NODES="${COMPARE_TASKS}"
 BUILD_HACC="${HACC_BUILD:-1}"
-OMPFILE_SCHEDULER="${HACC_OMPFILE_SCHEDULER:-${LIBOMPFILE_SCHEDULER:-HEADNODE}}"
 
 if [[ ! "${COMPARE_PARTICLES}" =~ ^[0-9]+$ ]] || (( COMPARE_PARTICLES < 1 )); then
   echo "Error: HACC_COMPARE_PARTICLES must be a positive integer, got '${COMPARE_PARTICLES}'." >&2
@@ -202,7 +201,6 @@ run_ompfile() { # mode (ompfile-wt|ompfile-wb[-conc]) extra_env_stmt [concurrenc
       export LIBOMPFILE_MPP_OPEN=1 && \
       export LIBOMPFILE_MPP_IO=1 && \
       export LIBOMPFILE_MPP_PING=1 && \
-      export LIBOMPFILE_SCHEDULER=${OMPFILE_SCHEDULER} && \
       export LIBOMPFILE_OPT_OPEN_CACHE=1 && \
       export LIBOMPFILE_OPT_OPEN_CACHE_KEEP_OPEN=1 && \
       export LIBOMPFILE_OPT_STATS=1 && \
@@ -277,7 +275,6 @@ run_ompfile_target() { # mode extra_env [fpr] [async] [segmented] [concurrent] [
       export LIBOMPFILE_MPP_OPEN=1 && \
       export LIBOMPFILE_MPP_IO=1 && \
       export LIBOMPFILE_MPP_PING=1 && \
-      export LIBOMPFILE_SCHEDULER=${OMPFILE_SCHEDULER} && \
       export LIBOMPFILE_OPT_OPEN_CACHE=1 && \
       export LIBOMPFILE_OPT_OPEN_CACHE_KEEP_OPEN=1 && \
       export LIBOMPFILE_OPT_STATS=1 && \
@@ -343,7 +340,6 @@ run_ior_target() { # mode extra_env_stmt [shared] [read_shift]
       export LIBOMPFILE_MPP_OPEN=1 && \
       export LIBOMPFILE_MPP_IO=1 && \
       export LIBOMPFILE_MPP_PING=1 && \
-      export LIBOMPFILE_SCHEDULER=${OMPFILE_SCHEDULER} && \
       export LIBOMPFILE_OPT_OPEN_CACHE=1 && \
       export LIBOMPFILE_OPT_OPEN_CACHE_KEEP_OPEN=1 && \
       export LIBOMPFILE_OPT_STATS=1 && \
